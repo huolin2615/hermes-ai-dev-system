@@ -175,9 +175,17 @@ test("runs the low-risk local workflow to a reviewed local commit", async () => 
     /The TypeScript controller owns git staging and commits/,
   );
   assert.ok(calls.comments.some((comment) => comment.includes("codex://threads/thread-1")));
+  const completedState = await store.readJson<{
+    stage: string;
+    revision: number;
+  }>("state.json");
+  assert.equal(completedState.stage, "completed");
+  const stateEvents = (await store.readWorkflowEvents()).filter(
+    (event) => event.type === "state_changed",
+  );
   assert.equal(
-    (await store.readJson<{ stage: string }>("state.json")).stage,
-    "completed",
+    stateEvents.at(-1)?.stateRevision,
+    completedState.revision,
   );
   assert.equal(
     (await store.readJson<{ status: string }>("metrics.json")).status,

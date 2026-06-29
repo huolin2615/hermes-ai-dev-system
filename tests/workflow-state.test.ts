@@ -3,11 +3,28 @@ import test from "node:test";
 
 import {
   createWorkflowState,
+  parseWorkflowState,
   reduceWorkflowState,
 } from "../src/workflow/state.js";
 
+test("migrates v1 state and starts revision at zero", () => {
+  const state = parseWorkflowState({
+    version: 1,
+    taskId: "t_1",
+    projectId: "crm",
+    stage: "planning",
+    repairAttempts: 0,
+    maxFixCycles: 2,
+    updatedAt: "2026-06-30T00:00:00.000Z",
+  });
+
+  assert.equal(state.version, 2);
+  assert.equal(state.revision, 0);
+});
+
 test("moves through the automatic happy path", () => {
   let state = createWorkflowState("task-1", "crm-frontend");
+  const initialRevision = state.revision;
 
   state = reduceWorkflowState(state, { type: "CONTEXT_PREPARED" });
   state = reduceWorkflowState(state, {
@@ -23,6 +40,7 @@ test("moves through the automatic happy path", () => {
 
   assert.equal(state.stage, "completed");
   assert.equal(state.codexThreadId, "thread-1");
+  assert.equal(state.revision, initialRevision + 7);
 });
 
 test("pauses a risky plan for approval and resumes", () => {
@@ -60,4 +78,14 @@ test("rejects invalid transitions instead of silently skipping stages", () => {
     () => reduceWorkflowState(state, { type: "IMPLEMENTATION_DONE" }),
     /invalid workflow transition/,
   );
+});
+
+test("increments revision exactly once for a block transition", () => {
+  const state = createWorkflowState("task-5", "crm-frontend");
+  const blocked = reduceWorkflowState(state, {
+    type: "BLOCK",
+    reason: "operator input required",
+  });
+
+  assert.equal(blocked.revision, state.revision + 1);
 });

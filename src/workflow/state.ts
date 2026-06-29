@@ -1,3 +1,5 @@
+import { z } from "zod";
+
 export type WorkflowStage =
   | "context_preparing"
   | "planning"
@@ -11,18 +13,68 @@ export type WorkflowStage =
   | "blocked"
   | "completed";
 
+const workflowStageSchema = z.enum([
+  "context_preparing",
+  "planning",
+  "awaiting_plan_approval",
+  "implementing",
+  "verifying",
+  "reviewing",
+  "fixing",
+  "knowledge",
+  "finalizing",
+  "blocked",
+  "completed",
+]);
+
+const blockedFromSchema = z.enum([
+  "context_preparing",
+  "planning",
+  "awaiting_plan_approval",
+  "implementing",
+  "verifying",
+  "reviewing",
+  "fixing",
+  "knowledge",
+  "finalizing",
+]);
+
 export interface WorkflowState {
-  version: 1;
+  version: 2;
+  revision: number;
   taskId: string;
   projectId: string;
   stage: WorkflowStage;
-  codexThreadId?: string;
+  codexThreadId?: string | undefined;
   repairAttempts: number;
   maxFixCycles: number;
   blockedReason?: string | undefined;
   blockedFrom?: Exclude<WorkflowStage, "blocked" | "completed"> | undefined;
   updatedAt: string;
 }
+
+const sharedStateShape = {
+  taskId: z.string().min(1),
+  projectId: z.string().min(1),
+  stage: workflowStageSchema,
+  codexThreadId: z.string().min(1).optional(),
+  repairAttempts: z.number().int().nonnegative(),
+  maxFixCycles: z.number().int().nonnegative(),
+  blockedReason: z.string().optional(),
+  blockedFrom: blockedFromSchema.optional(),
+  updatedAt: z.string().min(1),
+};
+
+const workflowStateV1Schema = z.strictObject({
+  version: z.literal(1),
+  ...sharedStateShape,
+});
+
+const workflowStateV2Schema = z.strictObject({
+  version: z.literal(2),
+  revision: z.number().int().nonnegative(),
+  ...sharedStateShape,
+});
 
 export type WorkflowEvent =
   | { type: "CONTEXT_PREPARED" }
@@ -44,13 +96,31 @@ export function createWorkflowState(
   maxFixCycles = 2,
 ): WorkflowState {
   return {
-    version: 1,
+    version: 2,
+    revision: 0,
     taskId,
     projectId,
     stage: "context_preparing",
     repairAttempts: 0,
     maxFixCycles,
     updatedAt: new Date().toISOString(),
+  };
+}
+
+export function parseWorkflowState(input: unknown): WorkflowState {
+  if (
+    input !== null &&
+    typeof input === "object" &&
+    "version" in input &&
+    input.version === 2
+  ) {
+    return workflowStateV2Schema.parse(input);
+  }
+  const legacy = workflowStateV1Schema.parse(input);
+  return {
+    ...legacy,
+    version: 2,
+    revision: 0,
   };
 }
 
@@ -62,6 +132,7 @@ function updated(state: WorkflowState, patch: Partial<WorkflowState>): WorkflowS
   return {
     ...state,
     ...patch,
+    revision: state.revision + 1,
     updatedAt: new Date().toISOString(),
   };
 }

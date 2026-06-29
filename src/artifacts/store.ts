@@ -11,6 +11,15 @@ import { randomUUID } from "node:crypto";
 
 import { redactSecrets } from "../security/redact.js";
 
+export interface WorkflowEventRecord {
+  eventId: string;
+  timestamp: string;
+  actor: "worker" | "operator" | "hermes";
+  stateRevision: number;
+  type: string;
+  payload: Record<string, unknown>;
+}
+
 function safeSegment(value: string, label: string): string {
   if (!/^[A-Za-z0-9._-]+$/.test(value)) {
     throw new Error(`${label} contains unsupported characters`);
@@ -20,7 +29,6 @@ function safeSegment(value: string, label: string): string {
 
 export class ArtifactStore {
   readonly taskRoot: string;
-  private sequence: number | undefined;
 
   constructor(root: string, board: string, taskId: string) {
     this.taskRoot = path.resolve(
@@ -57,35 +65,57 @@ export class ArtifactStore {
     await rename(temporary, target);
   }
 
-  private async nextSequence(): Promise<number> {
-    if (this.sequence === undefined) {
-      const eventsPath = this.resolve("events.jsonl");
-      try {
-        const file = await readFile(eventsPath, "utf8");
-        this.sequence = file.split("\n").filter(Boolean).length;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-          throw error;
-        }
-        this.sequence = 0;
-      }
+  async appendWorkflowEvent(
+    actor: WorkflowEventRecord["actor"],
+    stateRevision: number,
+    type: string,
+    payload: Record<string, unknown>,
+  ): Promise<WorkflowEventRecord> {
+    const target = this.resolve("events.jsonl");
+    await mkdir(path.dirname(target), { recursive: true });
+    const record: WorkflowEventRecord = {
+      eventId: randomUUID(),
+      timestamp: new Date().toISOString(),
+      actor,
+      stateRevision,
+      type,
+      payload,
+    };
+    await appendFile(
+      target,
+      `${redactSecrets(JSON.stringify(record))}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    return record;
+  }
+
+  async readWorkflowEvents(): Promise<WorkflowEventRecord[]> {
+    let source: string;
+    try {
+      source = await readFile(this.resolve("events.jsonl"), "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
     }
-    this.sequence += 1;
-    return this.sequence;
+    const events = source
+      .split("\n")
+      .filter(Boolean)
+      .map((line, index) => normalizeWorkflowEvent(JSON.parse(line), index));
+    return events.sort(
+      (left, right) =>
+        left.timestamp.localeCompare(right.timestamp) ||
+        left.eventId.localeCompare(right.eventId),
+    );
   }
 
   async appendEvent(event: Record<string, unknown>): Promise<void> {
-    const target = this.resolve("events.jsonl");
-    await mkdir(path.dirname(target), { recursive: true });
-    const sequence = await this.nextSequence();
-    const record = redactSecrets(
-      JSON.stringify({
-        sequence,
-        timestamp: new Date().toISOString(),
-        ...event,
-      }),
+    const { type, ...payload } = event;
+    await this.appendWorkflowEvent(
+      "operator",
+      0,
+      typeof type === "string" ? type : "legacy_event",
+      payload,
     );
-    await appendFile(target, `${record}\n`, { encoding: "utf8", mode: 0o600 });
   }
 
   async exists(relativePath: string): Promise<boolean> {
@@ -99,4 +129,66 @@ export class ArtifactStore {
       throw error;
     }
   }
+}
+
+function normalizeWorkflowEvent(
+  value: unknown,
+  index: number,
+): WorkflowEventRecord {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`invalid workflow event at line ${index + 1}`);
+  }
+  const record = value as Record<string, unknown>;
+  const timestamp =
+    typeof record.timestamp === "string"
+      ? record.timestamp
+      : new Date(0).toISOString();
+  const type = typeof record.type === "string" ? record.type : "legacy_event";
+  if (
+    typeof record.eventId === "string" &&
+    (record.actor === "worker" ||
+      record.actor === "operator" ||
+      record.actor === "hermes") &&
+    typeof record.stateRevision === "number" &&
+    record.payload !== null &&
+    typeof record.payload === "object" &&
+    !Array.isArray(record.payload)
+  ) {
+    return {
+      eventId: record.eventId,
+      timestamp,
+      actor: record.actor,
+      stateRevision: record.stateRevision,
+      type,
+      payload: record.payload as Record<string, unknown>,
+    };
+  }
+
+  const {
+    sequence,
+    timestamp: _timestamp,
+    type: _type,
+    eventId: _eventId,
+    actor: _actor,
+    stateRevision: _stateRevision,
+    payload: legacyPayload,
+    ...legacyFields
+  } = record;
+  return {
+    eventId: `legacy-${timestamp}-${String(sequence ?? index)}`,
+    timestamp,
+    actor:
+      record.actor === "operator" || record.actor === "hermes"
+        ? record.actor
+        : "worker",
+    stateRevision:
+      typeof record.stateRevision === "number" ? record.stateRevision : 0,
+    type,
+    payload:
+      legacyPayload !== null &&
+      typeof legacyPayload === "object" &&
+      !Array.isArray(legacyPayload)
+        ? (legacyPayload as Record<string, unknown>)
+        : legacyFields,
+  };
 }

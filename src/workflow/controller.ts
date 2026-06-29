@@ -21,6 +21,7 @@ import {
 import { assessPlanRisk } from "./risk.js";
 import {
   createWorkflowState,
+  parseWorkflowState,
   reduceWorkflowState,
   type WorkflowState,
 } from "./state.js";
@@ -224,13 +225,18 @@ export class TaskController {
     maxFixCycles: number,
   ): Promise<WorkflowState> {
     return (await store.exists("state.json"))
-      ? store.readJson<WorkflowState>("state.json")
+      ? parseWorkflowState(await store.readJson<unknown>("state.json"))
       : createWorkflowState(taskId, projectId, maxFixCycles);
   }
 
   private async persist(store: ArtifactStore, state: WorkflowState): Promise<void> {
     await store.writeJson("state.json", state);
-    await store.appendEvent({ type: "state_changed", stage: state.stage });
+    await store.appendWorkflowEvent(
+      "worker",
+      state.revision,
+      "state_changed",
+      { stage: state.stage },
+    );
   }
 
   private async recordMetrics(
@@ -396,6 +402,7 @@ export class TaskController {
         );
         state = {
           version: state.version,
+          revision: state.revision + 1,
           taskId: state.taskId,
           projectId: state.projectId,
           stage: "planning",
