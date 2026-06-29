@@ -1,0 +1,20 @@
+mcp_servers:
+  hermes_ai_dev:
+    command: /Users/huolin/.local/bin/node
+    args:
+      - /Users/huolin/Documents/知识库搭建/dist/mcp.js
+    env:
+      AI_DEV_CONFIG_DIR: /Users/huolin/Documents/知识库搭建/config/projects
+      AI_DEV_RUNTIME_DIR: /Users/huolin/Documents/知识库搭建/.ai-dev
+    enabled: true
+    timeout: 120
+    connect_timeout: 30
+    supports_parallel_tool_calls: false
+    tools:
+      include:
+        - ai_dev_submit
+        - ai_dev_status
+        - ai_dev_approve_plan
+        - ai_dev_pause
+      resources: false
+      prompts: false

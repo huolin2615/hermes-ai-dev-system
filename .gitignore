@@ -1,0 +1,9 @@
+node_modules/
+.pnpm-store/
+dist/
+.test-dist/
+.ai-dev/
+coverage/
+.worktrees/
+*.log
+.DS_Store

@@ -1,0 +1,41 @@
+schema_version: 1
+id: my-project
+
+repo:
+  path: /absolute/path/to/repository
+  base_branch: main
+  require_clean: true
+
+hermes:
+  board: my-project
+  assignee: ai-dev
+
+codex:
+  network: false
+  reasoning_effort: high
+  turn_timeout_seconds: 1800
+
+review:
+  model: sonnet
+  max_fix_cycles: 2
+  max_turns: 8
+
+verification:
+  commands:
+    - id: typecheck
+      argv: [pnpm, typecheck]
+      required: true
+      timeout_seconds: 600
+    - id: test
+      argv: [pnpm, test]
+      required: true
+      timeout_seconds: 900
+
+knowledge:
+  vault_path: /Users/huolin/Documents/Obsidian Vault
+  project_path: AI Dev/Projects/my-project
+  task_logs: auto
+  reusable_knowledge: ask
+
+ci:
+  mode: local
