@@ -102,6 +102,7 @@ function dependencies(overrides: Partial<TaskControllerDependencies> = {}) {
         return {
           changedFiles: ["src/orders.ts"],
           deletedFiles: [],
+          renamedFiles: [],
           diff: "diff",
         };
       },
@@ -210,6 +211,47 @@ test("blocks a high-risk plan before Codex can modify the worktree", async () =>
   );
 });
 
+test("reviews a pure rename without requesting deletion approval", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ai-dev-controller-"));
+  const store = new ArtifactStore(root, "crm", "t_rename");
+  let receivedReviewPrompt = "";
+  const { value, calls } = dependencies({
+    git: {
+      async collect() {
+        return {
+          changedFiles: ["src/new.ts", "src/old.ts"],
+          deletedFiles: [],
+          renamedFiles: [{ from: "src/old.ts", to: "src/new.ts" }],
+          diff: "renamed",
+        };
+      },
+      async restoreDeleted() {
+        calls.restore += 1;
+      },
+      async commit() {
+        return "rename123";
+      },
+    },
+    claude: {
+      async review(input) {
+        receivedReviewPrompt = input.prompt;
+        return review;
+      },
+    },
+  });
+
+  const outcome = await new TaskController(value).run({
+    config: parseProjectConfig(configInput),
+    task: { id: "t_rename", title: "Rename module", requirement: "Rename it." },
+    claim: { runId: 16, workspacePath: "/tmp/worktree" },
+    store,
+  });
+
+  assert.equal(outcome.status, "completed");
+  assert.equal(calls.restore, 0);
+  assert.match(receivedReviewPrompt, /src\/old\.ts -> src\/new\.ts/);
+});
+
 test("blocks unapproved file deletions discovered after implementation", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "ai-dev-controller-"));
   const store = new ArtifactStore(root, "crm", "t_3");
@@ -219,6 +261,7 @@ test("blocks unapproved file deletions discovered after implementation", async (
         return {
           changedFiles: ["src/legacy.ts"],
           deletedFiles: ["src/legacy.ts"],
+          renamedFiles: [],
           diff: "deleted",
         };
       },
@@ -272,6 +315,7 @@ test("allows only deletions bound to the explicitly approved plan", async () => 
         return {
           changedFiles: ["src/legacy.ts"],
           deletedFiles: ["src/legacy.ts"],
+          renamedFiles: [],
           diff: "deleted",
         };
       },
@@ -323,6 +367,7 @@ test("restores and blocks multiple deletions even when the plan was approved", a
         return {
           changedFiles: [...deletionPlan.files],
           deletedFiles: [...deletionPlan.files],
+          renamedFiles: [],
           diff: "deleted two files",
         };
       },

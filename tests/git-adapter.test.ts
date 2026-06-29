@@ -25,6 +25,9 @@ test("collects changed files and diff without modifying the index", async () => 
     if (options.argv.includes("status")) {
       return result(" M src/orders.ts\u0000?? tests/orders.test.ts\u0000");
     }
+    if (options.argv.includes("--name-status")) {
+      return result("");
+    }
     return result("diff --git a/src/orders.ts b/src/orders.ts\n");
   });
 
@@ -63,7 +66,28 @@ test("detects deletions for an explicit approval gate", async () => {
 
   const facts = await adapter.collect("/tmp/worktree");
 
-  assert.deepEqual(facts.deletedFiles, ["src/legacy.ts", "src/old.ts"]);
+  assert.deepEqual(facts.changedFiles, [
+    "src/legacy.ts",
+    "src/new.ts",
+    "src/old.ts",
+  ]);
+  assert.deepEqual(facts.deletedFiles, ["src/legacy.ts"]);
+  assert.deepEqual(facts.renamedFiles, [
+    { from: "src/old.ts", to: "src/new.ts" },
+  ]);
+});
+
+test("rejects a malformed porcelain rename without a source path", async () => {
+  const adapter = new GitAdapter(async ({ argv }) =>
+    argv.includes("status")
+      ? result("R  src/new.ts\u0000")
+      : result(""),
+  );
+
+  await assert.rejects(
+    adapter.collect("/tmp/worktree"),
+    /malformed git rename output/,
+  );
 });
 
 test("restores each undeclared deletion by exact path without a shell", async () => {
@@ -140,5 +164,47 @@ test("validates a task branch through git without shell interpolation", async ()
     "check-ref-format",
     "--branch",
     "codex/crm-order-filter",
+  ]);
+});
+
+test("collects committed task changes against the configured base branch", async () => {
+  const calls: string[][] = [];
+  const adapter = new GitAdapter(async ({ argv }) => {
+    calls.push(argv);
+    if (argv.includes("status")) return result("");
+    if (argv.includes("--name-status")) {
+      return result("M\u0000src/app.js\u0000A\u0000tests/app.test.js\u0000");
+    }
+    return result("diff --git a/src/app.js b/src/app.js\n");
+  });
+
+  const facts = await adapter.collect("/tmp/worktree", "main");
+
+  assert.deepEqual(facts.changedFiles, ["src/app.js", "tests/app.test.js"]);
+  assert.ok(calls.some((argv) => argv.includes("main")));
+});
+
+test("classifies committed renames without requesting deletion approval", async () => {
+  const adapter = new GitAdapter(async ({ argv }) => {
+    if (argv.includes("status")) return result("");
+    if (argv.includes("--name-status")) {
+      return result(
+        "R100\u0000src/old-name.ts\u0000src/new-name.ts\u0000" +
+          "D\u0000src/legacy.ts\u0000",
+      );
+    }
+    return result("diff --git a/src/old-name.ts b/src/new-name.ts\n");
+  });
+
+  const facts = await adapter.collect("/tmp/worktree", "main");
+
+  assert.deepEqual(facts.changedFiles, [
+    "src/legacy.ts",
+    "src/new-name.ts",
+    "src/old-name.ts",
+  ]);
+  assert.deepEqual(facts.deletedFiles, ["src/legacy.ts"]);
+  assert.deepEqual(facts.renamedFiles, [
+    { from: "src/old-name.ts", to: "src/new-name.ts" },
   ]);
 });

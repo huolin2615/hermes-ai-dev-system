@@ -5,6 +5,7 @@ import {
   type CommandResult,
   type RunCommandOptions,
 } from "../process/runner.js";
+import { normalizeReviewVerdict } from "../workflow/review-policy.js";
 
 const blockerSchema = z.strictObject({
   id: z.string(),
@@ -30,6 +31,33 @@ export type ReviewCommandExecutor = (
   options: RunCommandOptions,
 ) => Promise<CommandResult>;
 
+function parseJsonText(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    const fenced = value
+      .trim()
+      .match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1];
+    if (fenced) {
+      try {
+        return JSON.parse(fenced);
+      } catch {
+        // Continue to the conservative object-boundary fallback.
+      }
+    }
+    const firstBrace = value.indexOf("{");
+    const lastBrace = value.lastIndexOf("}");
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      try {
+        return JSON.parse(value.slice(firstBrace, lastBrace + 1));
+      } catch {
+        return value;
+      }
+    }
+    return value;
+  }
+}
+
 function reviewCandidate(stdout: string): unknown {
   let parsed: unknown;
   try {
@@ -38,14 +66,15 @@ function reviewCandidate(stdout: string): unknown {
     throw new Error("invalid Claude review output: response is not JSON");
   }
   if (parsed && typeof parsed === "object" && "structured_output" in parsed) {
-    return (parsed as { structured_output: unknown }).structured_output;
+    const structuredOutput = (parsed as { structured_output: unknown })
+      .structured_output;
+    if (typeof structuredOutput === "string") {
+      return parseJsonText(structuredOutput);
+    }
+    return structuredOutput;
   }
   if (parsed && typeof parsed === "object" && typeof (parsed as { result?: unknown }).result === "string") {
-    try {
-      return JSON.parse((parsed as { result: string }).result);
-    } catch {
-      return (parsed as { result: string }).result;
-    }
+    return parseJsonText((parsed as { result: string }).result);
   }
   return parsed;
 }
@@ -60,8 +89,8 @@ export class ClaudeReviewAdapter {
     maxTurns: number;
     signal?: AbortSignal;
   }): Promise<ClaudeReview> {
-    const result = await this.execute({
-      argv: [
+    const outputSchema = JSON.stringify(z.toJSONSchema(claudeReviewSchema));
+    const argv: [string, ...string[]] = [
         "claude",
         "-p",
         "--safe-mode",
@@ -78,15 +107,26 @@ export class ClaudeReviewAdapter {
         "--output-format",
         "json",
         "--json-schema",
-        JSON.stringify(z.toJSONSchema(claudeReviewSchema)),
+        outputSchema,
         "--no-chrome",
         "--disable-slash-commands",
-      ],
+      ];
+    const command = {
+      argv,
       cwd: input.cwd,
-      input: input.prompt,
       timeoutMs: 15 * 60_000,
       maxOutputBytes: 2_000_000,
       signal: input.signal,
+    };
+    const result = await this.execute({
+      ...command,
+      input: [
+        input.prompt,
+        "",
+        "# Required output",
+        "Return only one valid JSON object matching this schema. Do not wrap it in Markdown.",
+        outputSchema,
+      ].join("\n"),
     });
 
     if (result.exitCode !== 0) {
@@ -97,7 +137,32 @@ export class ClaudeReviewAdapter {
       );
     }
 
-    const parsed = claudeReviewSchema.safeParse(reviewCandidate(result.stdout));
+    let candidate = reviewCandidate(result.stdout);
+    let parsed = claudeReviewSchema.safeParse(candidate);
+    if (!parsed.success && typeof candidate === "string") {
+      const normalized = await this.execute({
+        ...command,
+        input: [
+          "Convert the review below into exactly one JSON object matching the schema.",
+          "Preserve its verdict and findings. Do not add commentary or Markdown.",
+          "",
+          "# Schema",
+          outputSchema,
+          "",
+          "# Review to normalize",
+          candidate,
+        ].join("\n"),
+      });
+      if (normalized.exitCode !== 0) {
+        throw new Error(
+          `Claude review normalization failed (${
+            normalized.exitCode ?? normalized.signal ?? "unknown"
+          }): ${normalized.stderr.trim() || normalized.stdout.trim()}`,
+        );
+      }
+      candidate = reviewCandidate(normalized.stdout);
+      parsed = claudeReviewSchema.safeParse(candidate);
+    }
     if (!parsed.success) {
       throw new Error(
         `invalid Claude review output: ${parsed.error.issues
@@ -105,6 +170,6 @@ export class ClaudeReviewAdapter {
           .join("; ")}`,
       );
     }
-    return parsed.data;
+    return normalizeReviewVerdict(parsed.data);
   }
 }

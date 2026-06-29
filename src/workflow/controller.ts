@@ -43,8 +43,12 @@ interface VerificationPort {
 }
 
 interface GitPort {
-  collect(cwd: string): Promise<GitFacts>;
-  restoreDeleted(cwd: string, relativePaths: string[]): Promise<void>;
+  collect(cwd: string, baseRef?: string): Promise<GitFacts>;
+  restoreDeleted(
+    cwd: string,
+    relativePaths: string[],
+    sourceRef?: string,
+  ): Promise<void>;
   commit(cwd: string, message: string): Promise<string>;
 }
 
@@ -183,6 +187,11 @@ function reviewPrompt(input: {
     "# Changed files",
     input.facts.changedFiles.join("\n"),
     "",
+    "# Renamed files",
+    input.facts.renamedFiles
+      .map((rename) => `${rename.from} -> ${rename.to}`)
+      .join("\n"),
+    "",
     "# Git diff",
     input.facts.diff,
     "",
@@ -293,6 +302,7 @@ export class TaskController {
     await this.dependencies.git.restoreDeleted(
       input.claim.workspacePath,
       facts.deletedFiles,
+      input.config.repo.baseBranch,
     );
     await input.store.writeJson("deletion-request.json", {
       files: facts.deletedFiles,
@@ -470,7 +480,10 @@ export class TaskController {
           });
           implementation = result;
           await input.store.writeJson("codex/implementation.json", result);
-          const facts = await this.dependencies.git.collect(input.claim.workspacePath);
+          const facts = await this.dependencies.git.collect(
+            input.claim.workspacePath,
+            input.config.repo.baseBranch,
+          );
           await input.store.writeJson("git/facts.json", facts);
           await input.store.writeText("git/diff.patch", facts.diff);
           const deletionBlock = await this.enforceDeletionPolicy(
@@ -543,7 +556,10 @@ export class TaskController {
           if (!plan || !verification) {
             throw new Error("review requires plan and verification evidence");
           }
-          const facts = await this.dependencies.git.collect(input.claim.workspacePath);
+          const facts = await this.dependencies.git.collect(
+            input.claim.workspacePath,
+            input.config.repo.baseBranch,
+          );
           latestReview = await this.dependencies.claude.review({
             cwd: input.claim.workspacePath,
             prompt: reviewPrompt({
@@ -575,7 +591,10 @@ export class TaskController {
           if (!implementation || !verification || !latestReview) {
             throw new Error("knowledge writeback requires implementation evidence");
           }
-          const facts = await this.dependencies.git.collect(input.claim.workspacePath);
+          const facts = await this.dependencies.git.collect(
+            input.claim.workspacePath,
+            input.config.repo.baseBranch,
+          );
           if (input.config.knowledge.taskLogs === "auto") {
             const logPath = await this.dependencies.knowledge.writeTaskLog({
               taskId: input.task.id,
@@ -647,7 +666,10 @@ export class TaskController {
         }
         case "finalizing": {
           if (!plan) throw new Error("finalization requires an approved plan");
-          const facts = await this.dependencies.git.collect(input.claim.workspacePath);
+          const facts = await this.dependencies.git.collect(
+            input.claim.workspacePath,
+            input.config.repo.baseBranch,
+          );
           const deletionBlock = await this.enforceDeletionPolicy(
             input,
             state,

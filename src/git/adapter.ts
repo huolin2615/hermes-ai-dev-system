@@ -11,6 +11,7 @@ export type GitCommandExecutor = (
 export interface GitFacts {
   changedFiles: string[];
   deletedFiles: string[];
+  renamedFiles: Array<{ from: string; to: string }>;
   diff: string;
 }
 
@@ -18,13 +19,36 @@ function uniqueSorted(values: string[]): string[] {
   return [...new Set(values)].sort();
 }
 
+function nullSeparatedRecords(value: string): string[] {
+  if (value.length === 0) return [];
+  if (!value.endsWith("\0")) {
+    throw new Error("malformed null-separated git output");
+  }
+  return value.slice(0, -1).split("\0");
+}
+
+function uniqueSortedRenames(
+  values: Array<{ from: string; to: string }>,
+): Array<{ from: string; to: string }> {
+  const renames = new Map<string, { from: string; to: string }>();
+  for (const rename of values) {
+    renames.set(`${rename.from}\0${rename.to}`, rename);
+  }
+  return [...renames.values()].sort(
+    (left, right) =>
+      left.from.localeCompare(right.from) || left.to.localeCompare(right.to),
+  );
+}
+
 function parsePorcelain(value: string): {
   changedFiles: string[];
   deletedFiles: string[];
+  renamedFiles: Array<{ from: string; to: string }>;
 } {
-  const records = value.split("\0").filter(Boolean);
+  const records = nullSeparatedRecords(value);
   const changedFiles: string[] = [];
   const deletedFiles: string[] = [];
+  const renamedFiles: Array<{ from: string; to: string }> = [];
 
   for (let index = 0; index < records.length; index += 1) {
     const record = records[index] ?? "";
@@ -38,15 +62,62 @@ function parsePorcelain(value: string): {
     }
     if (status.includes("R")) {
       const oldPath = records[index + 1];
-      if (oldPath) {
-        deletedFiles.push(oldPath);
-        index += 1;
+      if (!oldPath) {
+        throw new Error("malformed git rename output: source path is missing");
       }
+      changedFiles.push(oldPath);
+      renamedFiles.push({ from: oldPath, to: file });
+      index += 1;
     }
   }
   return {
     changedFiles: uniqueSorted(changedFiles),
     deletedFiles: uniqueSorted(deletedFiles),
+    renamedFiles: uniqueSortedRenames(renamedFiles),
+  };
+}
+
+function parseNameStatus(value: string): {
+  changedFiles: string[];
+  deletedFiles: string[];
+  renamedFiles: Array<{ from: string; to: string }>;
+} {
+  const records = nullSeparatedRecords(value);
+  const changedFiles: string[] = [];
+  const deletedFiles: string[] = [];
+  const renamedFiles: Array<{ from: string; to: string }> = [];
+
+  for (let index = 0; index < records.length; ) {
+    const status = records[index] ?? "";
+    index += 1;
+    const code = status.at(0);
+    if (code === "R") {
+      const from = records[index];
+      const to = records[index + 1];
+      if (!from || !to) {
+        throw new Error("malformed git rename output: path pair is incomplete");
+      }
+      changedFiles.push(from, to);
+      renamedFiles.push({ from, to });
+      index += 2;
+      continue;
+    }
+
+    const file = records[index];
+    if (!code || !file) {
+      throw new Error("malformed git name-status output");
+    }
+    changedFiles.push(file);
+    if (code === "D") {
+      deletedFiles.push(file);
+    }
+    index += 1;
+  }
+
+  return {
+    changedFiles: uniqueSorted(changedFiles),
+    deletedFiles: uniqueSorted(deletedFiles),
+    renamedFiles: uniqueSortedRenames(renamedFiles),
   };
 }
 
@@ -94,19 +165,47 @@ export class GitAdapter {
     await this.git(cwd, ["check-ref-format", "--branch", branch]);
   }
 
-  async collect(cwd: string): Promise<GitFacts> {
+  async collect(cwd: string, baseRef = "HEAD"): Promise<GitFacts> {
     const status = await this.git(cwd, ["status", "--porcelain=v1", "-z"]);
-    const diff = await this.git(cwd, ["diff", "--binary", "HEAD"]);
-    if (status.outputTruncated || diff.outputTruncated) {
+    const names = await this.git(cwd, [
+      "diff",
+      "--name-status",
+      "-z",
+      "--find-renames",
+      baseRef,
+    ]);
+    const diff = await this.git(cwd, ["diff", "--binary", baseRef]);
+    if (
+      status.outputTruncated ||
+      names.outputTruncated ||
+      diff.outputTruncated
+    ) {
       throw new Error("git evidence exceeded the configured capture limit");
     }
+    const workingTree = parsePorcelain(status.stdout);
+    const baseDiff = parseNameStatus(names.stdout);
     return {
-      ...parsePorcelain(status.stdout),
+      changedFiles: uniqueSorted([
+        ...workingTree.changedFiles,
+        ...baseDiff.changedFiles,
+      ]),
+      deletedFiles: uniqueSorted([
+        ...workingTree.deletedFiles,
+        ...baseDiff.deletedFiles,
+      ]),
+      renamedFiles: uniqueSortedRenames([
+        ...workingTree.renamedFiles,
+        ...baseDiff.renamedFiles,
+      ]),
       diff: diff.stdout,
     };
   }
 
-  async restoreDeleted(cwd: string, relativePaths: string[]): Promise<void> {
+  async restoreDeleted(
+    cwd: string,
+    relativePaths: string[],
+    sourceRef = "HEAD",
+  ): Promise<void> {
     for (const relativePath of relativePaths) {
       if (
         pathIsUnsafe(relativePath)
@@ -115,7 +214,7 @@ export class GitAdapter {
       }
       await this.git(cwd, [
         "restore",
-        "--source=HEAD",
+        `--source=${sourceRef}`,
         "--worktree",
         "--",
         relativePath,
