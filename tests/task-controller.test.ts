@@ -17,6 +17,7 @@ import {
   TaskController,
   type TaskControllerDependencies,
 } from "../src/workflow/controller.js";
+import { createWorkflowState } from "../src/workflow/state.js";
 
 const configInput = {
   schema_version: 1,
@@ -36,12 +37,17 @@ const configInput = {
 } as const;
 
 const plan: CodexPlan = {
+  version: 2,
   summary: "Implement order filters",
   assumptions: [],
   files: ["src/orders.ts"],
   tests: ["tests/orders.test.ts"],
-  requiresNetwork: false,
-  operations: [],
+  capabilities: {
+    network: false,
+    dependencyInstall: false,
+    externalWrite: false,
+  },
+  fileDeletions: [],
   questions: [],
   knowledgeNeeds: [],
 };
@@ -71,6 +77,7 @@ function dependencies(overrides: Partial<TaskControllerDependencies> = {}) {
     block: 0,
     restore: 0,
     network: [] as boolean[],
+    implementationPrompts: [] as string[],
     comments: [] as string[],
   };
   const value: TaskControllerDependencies = {
@@ -81,6 +88,7 @@ function dependencies(overrides: Partial<TaskControllerDependencies> = {}) {
       async implement(input) {
         calls.implement += 1;
         calls.network.push(input.network);
+        calls.implementationPrompts.push(input.prompt);
         return { ...implementation, usage: null };
       },
       desktopThreadUrl(id) {
@@ -162,6 +170,10 @@ test("runs the low-risk local workflow to a reviewed local commit", async () => 
   assert.equal(calls.complete, 1);
   assert.equal(calls.block, 0);
   assert.deepEqual(calls.network, [false]);
+  assert.match(
+    calls.implementationPrompts[0] ?? "",
+    /The TypeScript controller owns git staging and commits/,
+  );
   assert.ok(calls.comments.some((comment) => comment.includes("codex://threads/thread-1")));
   assert.equal(
     (await store.readJson<{ stage: string }>("state.json")).stage,
@@ -209,6 +221,167 @@ test("blocks a high-risk plan before Codex can modify the worktree", async () =>
     (await store.readJson<{ stage: string }>("state.json")).stage,
     "awaiting_plan_approval",
   );
+});
+
+test("binds required question answers to the approved implementation prompt", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ai-dev-controller-"));
+  const store = new ArtifactStore(root, "crm", "t_answers");
+  const questionPlan: CodexPlan = {
+    ...plan,
+    questions: [
+      {
+        id: "target_runtime",
+        prompt: "Which runtime should be targeted?",
+        required: true,
+      },
+    ],
+  };
+  const { value, calls } = dependencies({
+    codex: {
+      async plan() {
+        return { threadId: "thread-answers", plan: questionPlan, usage: null };
+      },
+      async implement(input) {
+        calls.implement += 1;
+        calls.implementationPrompts.push(input.prompt);
+        return { ...implementation, usage: null };
+      },
+      desktopThreadUrl(id) {
+        return `codex://threads/${id}`;
+      },
+    },
+  });
+  const controller = new TaskController(value);
+  const input = {
+    config: parseProjectConfig(configInput),
+    task: {
+      id: "t_answers",
+      title: "Runtime target",
+      requirement: "Use the selected runtime.",
+    },
+    claim: { runId: 17, workspacePath: "/tmp/worktree" },
+    store,
+  };
+
+  assert.equal((await controller.run(input)).status, "blocked");
+  await new OperatorControls(store).approve("plan", "huolin", "", {
+    target_runtime: "Node.js 22",
+  });
+  assert.equal((await controller.run(input)).status, "completed");
+  assert.match(
+    calls.implementationPrompts[0] ?? "",
+    /"target_runtime": "Node\.js 22"/,
+  );
+});
+
+test("rejects external writes even after explicit plan approval", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ai-dev-controller-"));
+  const store = new ArtifactStore(root, "crm", "t_external");
+  const externalPlan: CodexPlan = {
+    ...plan,
+    capabilities: {
+      ...plan.capabilities,
+      externalWrite: true,
+    },
+  };
+  const { value, calls } = dependencies({
+    codex: {
+      async plan() {
+        return { threadId: "thread-external", plan: externalPlan, usage: null };
+      },
+      async implement() {
+        calls.implement += 1;
+        return { ...implementation, usage: null };
+      },
+      desktopThreadUrl(id) {
+        return `codex://threads/${id}`;
+      },
+    },
+  });
+  const controller = new TaskController(value);
+  const input = {
+    config: parseProjectConfig(configInput),
+    task: {
+      id: "t_external",
+      title: "Publish branch",
+      requirement: "Push the branch.",
+    },
+    claim: { runId: 18, workspacePath: "/tmp/worktree" },
+    store,
+  };
+
+  assert.match(
+    (await controller.run(input)).reason ?? "",
+    /external writes are not supported/,
+  );
+  await new OperatorControls(store).approve("plan", "huolin");
+  assert.match(
+    (await controller.run(input)).reason ?? "",
+    /external writes are not supported/,
+  );
+  assert.equal(calls.implement, 0);
+});
+
+test("returns a persisted v1 deletion plan to planning for a typed v2 plan", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ai-dev-controller-"));
+  const store = new ArtifactStore(root, "crm", "t_replan");
+  await store.writeJson("state.json", {
+    ...createWorkflowState("t_replan", "crm", 2),
+    stage: "awaiting_plan_approval",
+    codexThreadId: "legacy-thread",
+  });
+  await store.writeJson("codex/plan.json", {
+    summary: "Delete legacy module",
+    assumptions: [],
+    files: ["src/legacy.ts"],
+    tests: [],
+    requiresNetwork: false,
+    operations: ["delete_file"],
+    questions: [],
+    knowledgeNeeds: [],
+  });
+  await store.writeJson("context/manifest.json", []);
+  await store.writeText("context/retrieved-context.md", "No prior context.");
+  const replanned: CodexPlan = {
+    ...plan,
+    summary: "Delete one exact legacy module",
+    files: ["src/legacy.ts"],
+    fileDeletions: ["src/legacy.ts"],
+  };
+  let planCalls = 0;
+  const { value } = dependencies({
+    codex: {
+      async plan() {
+        planCalls += 1;
+        return { threadId: "thread-v2", plan: replanned, usage: null };
+      },
+      async implement() {
+        throw new Error("must await approval");
+      },
+      desktopThreadUrl(id) {
+        return `codex://threads/${id}`;
+      },
+    },
+  });
+
+  const outcome = await new TaskController(value).run({
+    config: parseProjectConfig(configInput),
+    task: {
+      id: "t_replan",
+      title: "Delete legacy module",
+      requirement: "Delete src/legacy.ts.",
+    },
+    claim: { runId: 19, workspacePath: "/tmp/worktree" },
+    store,
+  });
+
+  assert.equal(outcome.status, "blocked");
+  assert.equal(planCalls, 1);
+  assert.equal(
+    (await store.readJson<{ version: number }>("codex/plan.json")).version,
+    2,
+  );
+  assert.equal(await store.exists("codex/legacy-plan-rejected.json"), true);
 });
 
 test("reviews a pure rename without requesting deletion approval", async () => {
@@ -295,7 +468,7 @@ test("allows only deletions bound to the explicitly approved plan", async () => 
   const deletionPlan: CodexPlan = {
     ...plan,
     files: ["src/legacy.ts"],
-    operations: ["delete_file"],
+    fileDeletions: ["src/legacy.ts"],
   };
   const { value, calls } = dependencies({
     codex: {
@@ -347,7 +520,7 @@ test("restores and blocks multiple deletions even when the plan was approved", a
   const deletionPlan: CodexPlan = {
     ...plan,
     files: ["src/legacy-a.ts", "src/legacy-b.ts"],
-    operations: ["delete_file"],
+    fileDeletions: ["src/legacy-a.ts"],
   };
   const { value, calls } = dependencies({
     codex: {

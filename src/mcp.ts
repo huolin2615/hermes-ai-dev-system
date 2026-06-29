@@ -26,6 +26,7 @@ interface AiDevServicePort {
     gate: "plan" | "knowledge",
     approvedBy: string,
     note?: string,
+    answers?: Record<string, string>,
   ): Promise<void>;
   operate(
     projectId: string,
@@ -87,10 +88,18 @@ export function createMcpServer(service: AiDevServicePort): McpServer {
         taskId: z.string().min(1),
         approvedBy: z.string().min(1),
         note: z.string().default(""),
+        answers: z.record(z.string(), z.string()).default({}),
       },
     },
-    async ({ projectId, taskId, approvedBy, note }) => {
-      await service.approve(projectId, taskId, "plan", approvedBy, note);
+    async ({ projectId, taskId, approvedBy, note, answers }) => {
+      await service.approve(
+        projectId,
+        taskId,
+        "plan",
+        approvedBy,
+        note,
+        answers,
+      );
       return text({ ok: true });
     },
   );

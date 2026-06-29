@@ -8,6 +8,22 @@ import { ArtifactStore } from "../src/artifacts/store.js";
 import { OperatorControls } from "../src/operator/controls.js";
 import { createWorkflowState } from "../src/workflow/state.js";
 
+const plan = {
+  version: 2,
+  summary: "Change one file",
+  assumptions: [],
+  files: ["src/app.ts"],
+  tests: [],
+  capabilities: {
+    network: false,
+    dependencyInstall: false,
+    externalWrite: false,
+  },
+  fileDeletions: [],
+  questions: [],
+  knowledgeNeeds: [],
+} as const;
+
 async function setup() {
   const root = await mkdtemp(path.join(os.tmpdir(), "ai-dev-controls-"));
   const store = new ArtifactStore(root, "crm", "t_1");
@@ -17,7 +33,7 @@ async function setup() {
 
 test("records auditable plan approval without deleting artifacts", async () => {
   const { store, controls } = await setup();
-  await store.writeJson("codex/plan.json", { summary: "plan" });
+  await store.writeJson("codex/plan.json", plan);
 
   await controls.approve("plan", "huolin", "approved exact changes");
 
@@ -29,6 +45,33 @@ test("records auditable plan approval without deleting artifacts", async () => {
   );
   assert.equal(approval.approvedBy, "huolin");
   assert.match(approval.planDigest, /^[a-f0-9]{64}$/);
+});
+
+test("requires and persists answers for every plan question", async () => {
+  const { store, controls } = await setup();
+  await store.writeJson("codex/plan.json", {
+    ...plan,
+    questions: [
+      {
+        id: "target_runtime",
+        prompt: "Which runtime should be targeted?",
+        required: true,
+      },
+    ],
+  });
+
+  await assert.rejects(
+    controls.approve("plan", "huolin", "", {}),
+    /missing answer for required plan question: target_runtime/,
+  );
+  await controls.approve("plan", "huolin", "", {
+    target_runtime: "Node.js 22",
+  });
+
+  const approval = await store.readJson<{ answers: Record<string, string> }>(
+    "approvals/plan.json",
+  );
+  assert.deepEqual(approval.answers, { target_runtime: "Node.js 22" });
 });
 
 test("pause and resume preserve the interrupted workflow stage", async () => {

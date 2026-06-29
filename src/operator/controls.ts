@@ -2,9 +2,21 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
 import type { ArtifactStore } from "../artifacts/store.js";
+import {
+  digestCodexPlan,
+  parseCodexPlan,
+  type CodexPlanV2,
+} from "../workflow/plan-contract.js";
 import type { WorkflowStage, WorkflowState } from "../workflow/state.js";
 
 export type ApprovalGate = "plan" | "knowledge";
+
+export interface PlanApprovalPayload {
+  planDigest: string;
+  approvedBy: string;
+  approvedAt: string;
+  answers: Record<string, string>;
+}
 
 function now(): string {
   return new Date().toISOString();
@@ -35,6 +47,7 @@ export class OperatorControls {
     gate: ApprovalGate,
     approvedBy: string,
     note = "",
+    answers: Record<string, string> = {},
   ): Promise<void> {
     if (gate === "plan" && !(await this.store.exists("codex/plan.json"))) {
       throw new Error("cannot approve a plan before Codex produced one");
@@ -45,10 +58,16 @@ export class OperatorControls {
     ) {
       throw new Error("cannot approve knowledge before a proposal exists");
     }
-    const planDigest =
+    const plan =
       gate === "plan"
-        ? digest(await this.store.readJson<unknown>("codex/plan.json"))
+        ? parseCodexPlan(
+            await this.store.readJson<unknown>("codex/plan.json"),
+          )
         : undefined;
+    const approvedAnswers = plan
+      ? requiredPlanAnswers(plan, answers)
+      : undefined;
+    const planDigest = plan ? digestCodexPlan(plan) : undefined;
     const proposalDigest =
       gate === "knowledge"
         ? digest(
@@ -67,6 +86,7 @@ export class OperatorControls {
       note,
       approvedAt: now(),
       ...(planDigest ? { planDigest } : {}),
+      ...(approvedAnswers ? { answers: approvedAnswers } : {}),
       ...(proposalDigest ? { proposalDigest } : {}),
     });
     await this.store.appendEvent({
@@ -157,4 +177,21 @@ export class OperatorControls {
     });
     await this.store.appendEvent({ type: "rereview_requested", requestedBy });
   }
+}
+
+function requiredPlanAnswers(
+  plan: CodexPlanV2,
+  answers: Record<string, string>,
+): Record<string, string> {
+  const approvedAnswers: Record<string, string> = {};
+  for (const question of plan.questions) {
+    const answer = answers[question.id]?.trim();
+    if (!answer) {
+      throw new Error(
+        `missing answer for required plan question: ${question.id}`,
+      );
+    }
+    approvedAnswers[question.id] = answer;
+  }
+  return approvedAnswers;
 }

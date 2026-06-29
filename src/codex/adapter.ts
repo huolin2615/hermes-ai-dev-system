@@ -8,16 +8,11 @@ import {
 } from "@openai/codex-sdk";
 import { z } from "zod";
 
-const planSchema = z.strictObject({
-  summary: z.string().min(1),
-  assumptions: z.array(z.string()),
-  files: z.array(z.string()),
-  tests: z.array(z.string()),
-  requiresNetwork: z.boolean(),
-  operations: z.array(z.string()),
-  questions: z.array(z.string()),
-  knowledgeNeeds: z.array(z.string()),
-});
+import {
+  codexPlanJsonSchema,
+  parseCodexPlan,
+  type CodexPlanV2,
+} from "../workflow/plan-contract.js";
 
 const implementationSchema = z.strictObject({
   summary: z.string().min(1),
@@ -27,7 +22,7 @@ const implementationSchema = z.strictObject({
   knowledgeCandidates: z.array(z.string()),
 });
 
-export type CodexPlan = z.infer<typeof planSchema>;
+export type CodexPlan = CodexPlanV2;
 export type CodexImplementationResult = z.infer<typeof implementationSchema>;
 
 export interface CodexThreadLike {
@@ -64,6 +59,18 @@ function parseOutput<T>(
   return result.data;
 }
 
+function parsePlanOutput(response: string): CodexPlan {
+  try {
+    return parseCodexPlan(parseJson(response, "Codex plan output"));
+  } catch (error) {
+    throw new Error(
+      `invalid Codex plan output: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
 function threadOptions(input: {
   cwd: string;
   sandboxMode: "read-only" | "workspace-write";
@@ -97,7 +104,7 @@ export class CodexAdapter {
         network: false,
       }),
     );
-    const options: TurnOptions = { outputSchema: z.toJSONSchema(planSchema) };
+    const options: TurnOptions = { outputSchema: codexPlanJsonSchema() };
     if (input.signal) options.signal = input.signal;
     const turn = await thread.run(input.prompt, options);
     if (!thread.id) {
@@ -105,7 +112,7 @@ export class CodexAdapter {
     }
     return {
       threadId: thread.id,
-      plan: parseOutput(turn.finalResponse, planSchema, "Codex plan output"),
+      plan: parsePlanOutput(turn.finalResponse),
       usage: turn.usage,
     };
   }

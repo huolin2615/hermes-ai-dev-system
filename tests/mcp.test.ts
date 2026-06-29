@@ -7,6 +7,16 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../src/mcp.js";
 
 test("exposes only the intended non-destructive Hermes MCP tools", async () => {
+  let approval:
+    | {
+        projectId: string;
+        taskId: string;
+        gate: "plan" | "knowledge";
+        approvedBy: string;
+        note: string;
+        answers: Record<string, string>;
+      }
+    | undefined;
   const service = {
     async submit() {
       return { taskId: "t_1", branch: "codex/test" };
@@ -24,7 +34,23 @@ test("exposes only the intended non-destructive Hermes MCP tools", async () => {
         artifactPath: "/tmp/artifacts",
       };
     },
-    async approve() {},
+    async approve(
+      projectId: string,
+      taskId: string,
+      gate: "plan" | "knowledge",
+      approvedBy: string,
+      note = "",
+      answers: Record<string, string> = {},
+    ) {
+      approval = {
+        projectId,
+        taskId,
+        gate,
+        approvedBy,
+        note,
+        answers,
+      };
+    },
     async operate() {},
   };
   const server = createMcpServer(service);
@@ -45,6 +71,24 @@ test("exposes only the intended non-destructive Hermes MCP tools", async () => {
     "ai_dev_submit",
   ]);
   assert.equal(names.some((name) => name.includes("cleanup")), false);
+  await client.callTool({
+    name: "ai_dev_approve_plan",
+    arguments: {
+      projectId: "crm",
+      taskId: "t_1",
+      approvedBy: "huolin",
+      note: "Use the chosen runtime",
+      answers: { target_runtime: "Node.js 22" },
+    },
+  });
+  assert.deepEqual(approval, {
+    projectId: "crm",
+    taskId: "t_1",
+    gate: "plan",
+    approvedBy: "huolin",
+    note: "Use the chosen runtime",
+    answers: { target_runtime: "Node.js 22" },
+  });
   await client.close();
   await server.close();
 });

@@ -39,12 +39,17 @@ test("plans in a read-only thread and returns a persisted thread id", async () =
       return fakeThread(
         "thread-1",
         {
+          version: 2,
           summary: "Add filters",
           assumptions: [],
           files: ["src/orders.ts"],
           tests: ["tests/orders.test.ts"],
-          requiresNetwork: false,
-          operations: [],
+          capabilities: {
+            network: false,
+            dependencyInstall: false,
+            externalWrite: false,
+          },
+          fileDeletions: [],
           questions: [],
           knowledgeNeeds: [],
         },
@@ -64,6 +69,7 @@ test("plans in a read-only thread and returns a persisted thread id", async () =
   });
 
   assert.equal(result.threadId, "thread-1");
+  assert.equal(result.plan.version, 2);
   assert.equal(result.plan.files[0], "src/orders.ts");
   assert.deepEqual(threadOptions[0], {
     workingDirectory: "/tmp/worktree",
@@ -73,7 +79,14 @@ test("plans in a read-only thread and returns a persisted thread id", async () =
     webSearchMode: "disabled",
     modelReasoningEffort: "high",
   });
-  assert.ok(calls[0]?.outputSchema);
+  assert.deepEqual(
+    (
+      calls[0]?.outputSchema as {
+        properties?: { version?: { const?: number } };
+      }
+    ).properties?.version,
+    { type: "number", const: 2 },
+  );
 });
 
 test("resumes the same thread with workspace-write for implementation", async () => {

@@ -105,10 +105,16 @@ export class AiDevService {
     gate: ApprovalGate,
     approvedBy: string,
     note = "",
+    answers: Record<string, string> = {},
   ): Promise<void> {
     const { hermes, store } = await this.resources(projectId, taskId);
     if (!store) throw new Error("artifact store unavailable");
-    await new OperatorControls(store).approve(gate, approvedBy, note);
+    await new OperatorControls(store).approve(
+      gate,
+      approvedBy,
+      note,
+      answers,
+    );
     await hermes.unblock(taskId);
   }
 

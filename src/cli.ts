@@ -42,6 +42,29 @@ function stringOption(
   return value;
 }
 
+function answersOption(options: Options): Record<string, string> {
+  const raw = options["answers-json"];
+  if (raw === undefined) return {};
+  if (typeof raw !== "string") {
+    throw new Error("--answers-json must be a JSON object");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("--answers-json must be valid JSON");
+  }
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    Object.values(parsed).some((value) => typeof value !== "string")
+  ) {
+    throw new Error("--answers-json must be an object of string answers");
+  }
+  return parsed as Record<string, string>;
+}
+
 function directories(options: Options): {
   configDirectory: string;
   runtimeRoot: string;
@@ -65,7 +88,8 @@ function help(): void {
       "  worker [--once] [--poll-seconds 30]",
       "  submit --project ID --title TEXT (--requirement TEXT | --requirement-file PATH) --idempotency-key KEY",
       "  status --project ID --task TASK",
-      "  approve-plan|approve-knowledge --project ID --task TASK --by NAME [--note TEXT]",
+      "  approve-plan --project ID --task TASK --by NAME [--note TEXT] [--answers-json JSON]",
+      "  approve-knowledge --project ID --task TASK --by NAME [--note TEXT]",
       "  pause|resume|retry|reprepare|rereview --project ID --task TASK --by NAME [--note TEXT]",
       "  cleanup-request --task TASK --target-type file|worktree --target-path ABSOLUTE --reason TEXT",
       "  cleanup-approve --request ID",
@@ -138,6 +162,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         command === "approve-plan" ? "plan" : "knowledge",
         stringOption(options, "by"),
         stringOption(options, "note", ""),
+        command === "approve-plan" ? answersOption(options) : {},
       );
       output({ ok: true });
       return 0;
