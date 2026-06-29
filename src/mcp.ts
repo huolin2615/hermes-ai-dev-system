@@ -7,7 +7,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { AiDevService } from "./runtime/service.js";
+import {
+  AiDevService,
+  type QueuedOperatorAction,
+} from "./runtime/service.js";
 
 interface AiDevServicePort {
   submit(input: {
@@ -27,14 +30,14 @@ interface AiDevServicePort {
     approvedBy: string,
     note?: string,
     answers?: Record<string, string>,
-  ): Promise<void>;
+  ): Promise<QueuedOperatorAction>;
   operate(
     projectId: string,
     taskId: string,
     operation: "pause" | "resume" | "retry" | "reprepare" | "rereview",
     requestedBy: string,
     note?: string,
-  ): Promise<void>;
+  ): Promise<QueuedOperatorAction>;
 }
 
 function text(value: unknown) {
@@ -92,16 +95,41 @@ export function createMcpServer(service: AiDevServicePort): McpServer {
       },
     },
     async ({ projectId, taskId, approvedBy, note, answers }) => {
-      await service.approve(
-        projectId,
-        taskId,
-        "plan",
-        approvedBy,
-        note,
-        answers,
+      return text(
+        await service.approve(
+          projectId,
+          taskId,
+          "plan",
+          approvedBy,
+          note,
+          answers,
+        ),
       );
-      return text({ ok: true });
     },
+  );
+
+  server.registerTool(
+    "ai_dev_approve_knowledge",
+    {
+      description:
+        "Queue approval for the current reusable-knowledge proposal.",
+      inputSchema: {
+        projectId: z.string().min(1),
+        taskId: z.string().min(1),
+        approvedBy: z.string().min(1),
+        note: z.string().default(""),
+      },
+    },
+    async ({ projectId, taskId, approvedBy, note }) =>
+      text(
+        await service.approve(
+          projectId,
+          taskId,
+          "knowledge",
+          approvedBy,
+          note,
+        ),
+      ),
   );
 
   server.registerTool(
@@ -116,17 +144,47 @@ export function createMcpServer(service: AiDevServicePort): McpServer {
         note: z.string().default(""),
       },
     },
-    async ({ projectId, taskId, requestedBy, note }) => {
-      await service.operate(
-        projectId,
-        taskId,
-        "pause",
-        requestedBy,
-        note,
-      );
-      return text({ ok: true });
-    },
+    async ({ projectId, taskId, requestedBy, note }) =>
+      text(
+        await service.operate(
+          projectId,
+          taskId,
+          "pause",
+          requestedBy,
+          note,
+        ),
+      ),
   );
+
+  for (const operation of [
+    "resume",
+    "retry",
+    "reprepare",
+    "rereview",
+  ] as const) {
+    server.registerTool(
+      `ai_dev_${operation}`,
+      {
+        description: `Queue the ${operation} operator action for worker consumption.`,
+        inputSchema: {
+          projectId: z.string().min(1),
+          taskId: z.string().min(1),
+          requestedBy: z.string().min(1),
+          note: z.string().default(""),
+        },
+      },
+      async ({ projectId, taskId, requestedBy, note }) =>
+        text(
+          await service.operate(
+            projectId,
+            taskId,
+            operation,
+            requestedBy,
+            note,
+          ),
+        ),
+    );
+  }
 
   return server;
 }

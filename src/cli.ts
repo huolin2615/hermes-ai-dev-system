@@ -42,27 +42,42 @@ function stringOption(
   return value;
 }
 
-function answersOption(options: Options): Record<string, string> {
-  const raw = options["answers-json"];
-  if (raw === undefined) return {};
-  if (typeof raw !== "string") {
-    throw new Error("--answers-json must be a JSON object");
+export async function readAnswersFile(
+  target: string,
+): Promise<Record<string, string>> {
+  if (!path.isAbsolute(target)) {
+    throw new Error("--answers-file must be an absolute path");
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(await readFile(target, "utf8"));
   } catch {
-    throw new Error("--answers-json must be valid JSON");
+    throw new Error("--answers-file must contain valid JSON");
   }
   if (
     parsed === null ||
     typeof parsed !== "object" ||
     Array.isArray(parsed) ||
-    Object.values(parsed).some((value) => typeof value !== "string")
+    Object.values(parsed).some(
+      (value) => typeof value !== "string" || value.trim().length === 0,
+    )
   ) {
-    throw new Error("--answers-json must be an object of string answers");
+    throw new Error(
+      "--answers-file must contain an object of non-empty string answers",
+    );
   }
   return parsed as Record<string, string>;
+}
+
+async function answersFileOption(
+  options: Options,
+): Promise<Record<string, string>> {
+  const target = options["answers-file"];
+  if (target === undefined) return {};
+  if (typeof target !== "string") {
+    throw new Error("--answers-file must be an absolute path");
+  }
+  return readAnswersFile(target);
 }
 
 function directories(options: Options): {
@@ -88,7 +103,7 @@ function help(): void {
       "  worker [--once] [--poll-seconds 30]",
       "  submit --project ID --title TEXT (--requirement TEXT | --requirement-file PATH) --idempotency-key KEY",
       "  status --project ID --task TASK",
-      "  approve-plan --project ID --task TASK --by NAME [--note TEXT] [--answers-json JSON]",
+      "  approve-plan --project ID --task TASK --by NAME [--note TEXT] [--answers-file ABSOLUTE]",
       "  approve-knowledge --project ID --task TASK --by NAME [--note TEXT]",
       "  pause|resume|retry|reprepare|rereview --project ID --task TASK --by NAME [--note TEXT]",
       "  cleanup-request --task TASK --target-type file|worktree --target-path ABSOLUTE --reason TEXT",
@@ -156,29 +171,33 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return 0;
     case "approve-plan":
     case "approve-knowledge":
-      await service.approve(
-        stringOption(options, "project"),
-        stringOption(options, "task"),
-        command === "approve-plan" ? "plan" : "knowledge",
-        stringOption(options, "by"),
-        stringOption(options, "note", ""),
-        command === "approve-plan" ? answersOption(options) : {},
+      output(
+        await service.approve(
+          stringOption(options, "project"),
+          stringOption(options, "task"),
+          command === "approve-plan" ? "plan" : "knowledge",
+          stringOption(options, "by"),
+          stringOption(options, "note", ""),
+          command === "approve-plan"
+            ? await answersFileOption(options)
+            : {},
+        ),
       );
-      output({ ok: true });
       return 0;
     case "pause":
     case "resume":
     case "retry":
     case "reprepare":
     case "rereview":
-      await service.operate(
-        stringOption(options, "project"),
-        stringOption(options, "task"),
-        command,
-        stringOption(options, "by"),
-        stringOption(options, "note", ""),
+      output(
+        await service.operate(
+          stringOption(options, "project"),
+          stringOption(options, "task"),
+          command,
+          stringOption(options, "by"),
+          stringOption(options, "note", ""),
+        ),
       );
-      output({ ok: true });
       return 0;
     case "cleanup-request": {
       const cleanup = new CleanupApprovalStore(

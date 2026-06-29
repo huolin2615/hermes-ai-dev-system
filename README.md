@@ -77,13 +77,18 @@ node dist/cli.js submit \
 node dist/cli.js status --project my-project --task t_123
 ```
 
-审批计划并让 Hermes 重新进入 ready：
+审批计划会写入不可变命令队列，并让 Hermes 重新进入 ready。计划包含问题时，
+通过绝对路径 JSON 文件提交答案：
 
 ```bash
 node dist/cli.js approve-plan \
   --project my-project --task t_123 --by huolin \
-  --note "已核对计划和删除目标"
+  --note "已核对计划和删除目标" \
+  --answers-file /absolute/path/to/answers.json
 ```
+
+命令返回 `{ "commandId": "...", "status": "queued" }`；worker 在下一状态
+边界应用或拒绝命令，并永久保留命令和结果文件。
 
 可用人工操作：
 

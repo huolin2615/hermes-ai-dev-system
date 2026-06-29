@@ -155,7 +155,7 @@ test("runs the low-risk local workflow to a reviewed local commit", async () => 
   const { value, calls } = dependencies();
   const controller = new TaskController(value);
 
-  const outcome = await controller.run({
+  const runInput = {
     config: parseProjectConfig({
       ...configInput,
       codex: { ...configInput.codex, network: true },
@@ -163,7 +163,8 @@ test("runs the low-risk local workflow to a reviewed local commit", async () => 
     task: { id: "t_1", title: "Order Filters", requirement: "Add filters." },
     claim: { runId: 10, workspacePath: "/tmp/worktree" },
     store,
-  });
+  };
+  const outcome = await controller.run(runInput);
 
   assert.equal(outcome.status, "completed");
   assert.equal(calls.implement, 1);
@@ -190,6 +191,17 @@ test("runs the low-risk local workflow to a reviewed local commit", async () => 
   assert.equal(
     (await store.readJson<{ status: string }>("metrics.json")).status,
     "completed",
+  );
+  const invalidCommand = await new OperatorControls(store).reprepare("huolin");
+  assert.equal((await controller.run(runInput)).status, "completed");
+  assert.equal(calls.implement, 1);
+  assert.equal(
+    (
+      await store.readJson<{ status: string }>(
+        `operator/results/${invalidCommand.commandId}.json`,
+      )
+    ).status,
+    "rejected",
   );
 });
 
@@ -272,14 +284,29 @@ test("binds required question answers to the approved implementation prompt", as
   };
 
   assert.equal((await controller.run(input)).status, "blocked");
-  await new OperatorControls(store).approve("plan", "huolin", "", {
-    target_runtime: "Node.js 22",
-  });
+  const approvalCommand = await new OperatorControls(store).approve(
+    "plan",
+    "huolin",
+    "",
+    {
+      target_runtime: "Node.js 22",
+    },
+  );
   assert.equal((await controller.run(input)).status, "completed");
   assert.match(
     calls.implementationPrompts[0] ?? "",
     /"target_runtime": "Node\.js 22"/,
   );
+  assert.equal(
+    (
+      await store.readJson<{ status: string }>(
+        `operator/results/${approvalCommand.commandId}.json`,
+      )
+    ).status,
+    "applied",
+  );
+  assert.equal((await controller.run(input)).status, "completed");
+  assert.equal(calls.implement, 1);
 });
 
 test("rejects external writes even after explicit plan approval", async () => {
@@ -322,12 +349,23 @@ test("rejects external writes even after explicit plan approval", async () => {
     (await controller.run(input)).reason ?? "",
     /external writes are not supported/,
   );
-  await new OperatorControls(store).approve("plan", "huolin");
+  const approvalCommand = await new OperatorControls(store).approve(
+    "plan",
+    "huolin",
+  );
   assert.match(
     (await controller.run(input)).reason ?? "",
     /external writes are not supported/,
   );
   assert.equal(calls.implement, 0);
+  assert.equal(
+    (
+      await store.readJson<{ status: string }>(
+        `operator/results/${approvalCommand.commandId}.json`,
+      )
+    ).status,
+    "rejected",
+  );
 });
 
 test("returns a persisted v1 deletion plan to planning for a typed v2 plan", async () => {

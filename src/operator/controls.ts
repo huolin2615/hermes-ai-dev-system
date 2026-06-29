@@ -7,7 +7,10 @@ import {
   parseCodexPlan,
   type CodexPlanV2,
 } from "../workflow/plan-contract.js";
-import type { WorkflowStage, WorkflowState } from "../workflow/state.js";
+import {
+  OperatorCommandQueue,
+  type OperatorCommand,
+} from "./commands.js";
 
 export type ApprovalGate = "plan" | "knowledge";
 
@@ -18,10 +21,6 @@ export interface PlanApprovalPayload {
   answers: Record<string, string>;
 }
 
-function now(): string {
-  return new Date().toISOString();
-}
-
 function digest(value: unknown): string {
   const source =
     typeof value === "string" || value instanceof Uint8Array
@@ -30,25 +29,19 @@ function digest(value: unknown): string {
   return createHash("sha256").update(source).digest("hex");
 }
 
-function resumableStage(state: WorkflowState): WorkflowStage {
-  if (!state.blockedFrom) {
-    throw new Error("blocked task has no resumable stage; use reprepare");
-  }
-  if (state.blockedReason?.includes("repair budget exhausted")) {
-    return "fixing";
-  }
-  return state.blockedFrom;
-}
-
 export class OperatorControls {
-  constructor(private readonly store: ArtifactStore) {}
+  private readonly queue: OperatorCommandQueue;
+
+  constructor(private readonly store: ArtifactStore) {
+    this.queue = new OperatorCommandQueue(store);
+  }
 
   async approve(
     gate: ApprovalGate,
     approvedBy: string,
     note = "",
     answers: Record<string, string> = {},
-  ): Promise<void> {
+  ): Promise<OperatorCommand> {
     if (gate === "plan" && !(await this.store.exists("codex/plan.json"))) {
       throw new Error("cannot approve a plan before Codex produced one");
     }
@@ -80,102 +73,84 @@ export class OperatorControls {
             ),
           )
         : undefined;
-    await this.store.writeJson(`approvals/${gate}.json`, {
-      gate,
-      approvedBy,
-      note,
-      approvedAt: now(),
-      ...(planDigest ? { planDigest } : {}),
-      ...(approvedAnswers ? { answers: approvedAnswers } : {}),
-      ...(proposalDigest ? { proposalDigest } : {}),
-    });
-    await this.store.appendEvent({
-      type: "operator_approval",
-      gate,
-      approvedBy,
+    const proposal =
+      gate === "knowledge"
+        ? await this.store.readJson<{ path: string }>(
+            "knowledge/proposal.json",
+          )
+        : undefined;
+    return this.queue.enqueue({
+      type: gate === "plan" ? "approve_plan" : "approve_knowledge",
+      requestedBy: approvedBy,
+      payload: {
+        note,
+        ...(planDigest ? { planDigest } : {}),
+        ...(approvedAnswers ? { answers: approvedAnswers } : {}),
+        ...(proposalDigest ? { proposalDigest } : {}),
+        ...(proposal ? { proposalPath: proposal.path } : {}),
+      },
     });
   }
 
-  async requestPause(requestedBy: string, note = ""): Promise<void> {
-    await this.store.writeJson("operator/pause.json", {
-      active: true,
+  async requestPause(
+    requestedBy: string,
+    note = "",
+  ): Promise<OperatorCommand> {
+    return this.queue.enqueue({
+      type: "pause",
       requestedBy,
-      note,
-      requestedAt: now(),
+      payload: { note },
     });
-    await this.store.appendEvent({ type: "pause_requested", requestedBy });
   }
 
-  async resume(resumedBy: string): Promise<void> {
-    await this.store.writeJson("operator/pause.json", {
-      active: false,
-      resumedBy,
-      resumedAt: now(),
+  async resume(
+    resumedBy: string,
+    note = "",
+  ): Promise<OperatorCommand> {
+    return this.queue.enqueue({
+      type: "resume",
+      requestedBy: resumedBy,
+      payload: { note },
     });
-    const state = await this.store.readJson<WorkflowState>("state.json");
-    if (
-      state.stage === "blocked" &&
-      state.blockedReason === "human takeover requested"
-    ) {
-      await this.store.writeJson("state.json", {
-        ...state,
-        stage: resumableStage(state),
-        blockedReason: undefined,
-        blockedFrom: undefined,
-        updatedAt: now(),
-      });
-    }
-    await this.store.appendEvent({ type: "resumed", resumedBy });
   }
 
-  async retry(requestedBy: string): Promise<void> {
-    const state = await this.store.readJson<WorkflowState>("state.json");
-    if (state.stage !== "blocked") {
-      throw new Error("retry is only valid for a blocked task");
-    }
-    const retryAfterBudget = state.blockedReason?.includes(
-      "repair budget exhausted",
-    );
-    await this.store.writeJson("state.json", {
-      ...state,
-      stage: resumableStage(state),
-      repairAttempts: retryAfterBudget
-        ? Math.max(0, state.repairAttempts - 1)
-        : state.repairAttempts,
-      blockedReason: undefined,
-      blockedFrom: undefined,
-      updatedAt: now(),
+  async retry(
+    requestedBy: string,
+    note = "",
+  ): Promise<OperatorCommand> {
+    return this.queue.enqueue({
+      type: "retry",
+      requestedBy,
+      payload: { note },
     });
-    await this.store.appendEvent({ type: "retry_requested", requestedBy });
   }
 
-  async reprepare(requestedBy: string): Promise<void> {
-    const state = await this.store.readJson<WorkflowState>("state.json");
-    const { codexThreadId: _oldThread, ...rest } = state;
-    await this.store.writeJson("state.json", {
-      ...rest,
-      stage: "context_preparing",
-      repairAttempts: 0,
-      blockedReason: undefined,
-      blockedFrom: undefined,
-      updatedAt: now(),
+  async reprepare(
+    requestedBy: string,
+    note = "",
+  ): Promise<OperatorCommand> {
+    return this.queue.enqueue({
+      type: "reprepare",
+      requestedBy,
+      payload: { note },
     });
-    await this.store.appendEvent({ type: "reprepare_requested", requestedBy });
   }
 
-  async rereview(requestedBy: string): Promise<void> {
+  async rereview(
+    requestedBy: string,
+    note = "",
+  ): Promise<OperatorCommand> {
     if (!(await this.store.exists("verification/latest.json"))) {
       throw new Error("cannot re-review before verification evidence exists");
     }
-    const state = await this.store.readJson<WorkflowState>("state.json");
-    await this.store.writeJson("state.json", {
-      ...state,
-      stage: "reviewing",
-      blockedReason: undefined,
-      blockedFrom: undefined,
-      updatedAt: now(),
+    const verificationDigest = digest(
+      await readFile(this.store.resolve("verification/latest.json")),
+    );
+    return this.queue.enqueue({
+      type: "rereview",
+      requestedBy,
+      payload: { note, verificationDigest },
     });
-    await this.store.appendEvent({ type: "rereview_requested", requestedBy });
   }
 }
 

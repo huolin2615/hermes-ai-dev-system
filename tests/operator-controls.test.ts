@@ -31,20 +31,20 @@ async function setup() {
   return { store, controls: new OperatorControls(store) };
 }
 
-test("records auditable plan approval without deleting artifacts", async () => {
+test("queues an auditable plan approval without writing approval state", async () => {
   const { store, controls } = await setup();
   await store.writeJson("codex/plan.json", plan);
 
-  await controls.approve("plan", "huolin", "approved exact changes");
-
-  const approval = await store.readJson<{
-    approvedBy: string;
-    planDigest: string;
-  }>(
-    "approvals/plan.json",
+  const command = await controls.approve(
+    "plan",
+    "huolin",
+    "approved exact changes",
   );
-  assert.equal(approval.approvedBy, "huolin");
-  assert.match(approval.planDigest, /^[a-f0-9]{64}$/);
+
+  assert.equal(command.type, "approve_plan");
+  assert.equal(command.requestedBy, "huolin");
+  assert.match(String(command.payload.planDigest), /^[a-f0-9]{64}$/);
+  assert.equal(await store.exists("approvals/plan.json"), false);
 });
 
 test("requires and persists answers for every plan question", async () => {
@@ -64,17 +64,17 @@ test("requires and persists answers for every plan question", async () => {
     controls.approve("plan", "huolin", "", {}),
     /missing answer for required plan question: target_runtime/,
   );
-  await controls.approve("plan", "huolin", "", {
+  const command = await controls.approve("plan", "huolin", "", {
     target_runtime: "Node.js 22",
   });
 
-  const approval = await store.readJson<{ answers: Record<string, string> }>(
-    "approvals/plan.json",
+  assert.deepEqual(
+    command.payload.answers,
+    { target_runtime: "Node.js 22" },
   );
-  assert.deepEqual(approval.answers, { target_runtime: "Node.js 22" });
 });
 
-test("pause and resume preserve the interrupted workflow stage", async () => {
+test("pause and resume enqueue without directly mutating workflow state", async () => {
   const { store, controls } = await setup();
   await store.writeJson("state.json", {
     ...createWorkflowState("t_1", "crm", 2),
@@ -86,13 +86,12 @@ test("pause and resume preserve the interrupted workflow stage", async () => {
   await controls.requestPause("huolin");
   await controls.resume("huolin");
 
-  const pause = await store.readJson<{ active: boolean }>("operator/pause.json");
   const state = await store.readJson<{ stage: string }>("state.json");
-  assert.equal(pause.active, false);
-  assert.equal(state.stage, "implementing");
+  assert.equal(state.stage, "blocked");
+  assert.equal(await store.exists("operator/pause.json"), false);
 });
 
-test("reprepare starts context again and retires the previous thread id", async () => {
+test("reprepare queues without retiring the thread before worker consumption", async () => {
   const { store, controls } = await setup();
   await store.writeJson("state.json", {
     ...createWorkflowState("t_1", "crm", 2),
@@ -105,8 +104,8 @@ test("reprepare starts context again and retires the previous thread id", async 
   await controls.reprepare("huolin");
 
   const state = await store.readJson<Record<string, unknown>>("state.json");
-  assert.equal(state.stage, "context_preparing");
-  assert.equal("codexThreadId" in state, false);
+  assert.equal(state.stage, "blocked");
+  assert.equal(state.codexThreadId, "thread-old");
 });
 
 test("rereview requires prior verification evidence", async () => {

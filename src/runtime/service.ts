@@ -18,6 +18,11 @@ export interface TaskStatus {
   artifactPath: string;
 }
 
+export interface QueuedOperatorAction {
+  commandId: string;
+  status: "queued";
+}
+
 async function optionalJson<T>(target: string): Promise<T | null> {
   try {
     return JSON.parse(await readFile(target, "utf8")) as T;
@@ -106,16 +111,17 @@ export class AiDevService {
     approvedBy: string,
     note = "",
     answers: Record<string, string> = {},
-  ): Promise<void> {
+  ): Promise<QueuedOperatorAction> {
     const { hermes, store } = await this.resources(projectId, taskId);
     if (!store) throw new Error("artifact store unavailable");
-    await new OperatorControls(store).approve(
+    const command = await new OperatorControls(store).approve(
       gate,
       approvedBy,
       note,
       answers,
     );
     await hermes.unblock(taskId);
+    return { commandId: command.commandId, status: "queued" };
   }
 
   async operate(
@@ -124,28 +130,30 @@ export class AiDevService {
     operation: "pause" | "resume" | "retry" | "reprepare" | "rereview",
     requestedBy: string,
     note = "",
-  ): Promise<void> {
+  ): Promise<QueuedOperatorAction> {
     const { hermes, store } = await this.resources(projectId, taskId);
     if (!store) throw new Error("artifact store unavailable");
     const controls = new OperatorControls(store);
+    let command;
     switch (operation) {
       case "pause":
-        await controls.requestPause(requestedBy, note);
+        command = await controls.requestPause(requestedBy, note);
         await hermes.comment(taskId, `Pause requested by ${requestedBy}: ${note}`);
-        return;
+        return { commandId: command.commandId, status: "queued" };
       case "resume":
-        await controls.resume(requestedBy);
+        command = await controls.resume(requestedBy, note);
         break;
       case "retry":
-        await controls.retry(requestedBy);
+        command = await controls.retry(requestedBy, note);
         break;
       case "reprepare":
-        await controls.reprepare(requestedBy);
+        command = await controls.reprepare(requestedBy, note);
         break;
       case "rereview":
-        await controls.rereview(requestedBy);
+        command = await controls.rereview(requestedBy, note);
         break;
     }
     await hermes.unblock(taskId);
+    return { commandId: command.commandId, status: "queued" };
   }
 }

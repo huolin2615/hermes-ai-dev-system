@@ -12,6 +12,11 @@ import { buildKnowledgeContext } from "../context/knowledge.js";
 import type { ArtifactStore } from "../artifacts/store.js";
 import type { GitFacts } from "../git/adapter.js";
 import type { KnowledgeWriter } from "../knowledge/writer.js";
+import {
+  applyOperatorCommand,
+  OperatorCommandQueue,
+  type OperatorCommand,
+} from "../operator/commands.js";
 import type { VerificationResult } from "../verification/runner.js";
 import {
   digestCodexPlan,
@@ -317,6 +322,94 @@ export class TaskController {
     };
   }
 
+  private async knowledgeProposal(
+    store: ArtifactStore,
+  ): Promise<{ path: string; digest: string } | undefined> {
+    if (!(await store.exists("knowledge/proposal.json"))) return undefined;
+    const proposal = await store.readJson<{ path: string }>(
+      "knowledge/proposal.json",
+    );
+    return {
+      path: proposal.path,
+      digest: createHash("sha256")
+        .update(await readFile(proposal.path))
+        .digest("hex"),
+    };
+  }
+
+  private async persistAppliedApproval(
+    store: ArtifactStore,
+    command: OperatorCommand,
+  ): Promise<void> {
+    if (command.type === "approve_plan") {
+      await store.writeJson("approvals/plan.json", {
+        gate: "plan",
+        commandId: command.commandId,
+        approvedBy: command.requestedBy,
+        approvedAt: command.requestedAt,
+        note:
+          typeof command.payload.note === "string"
+            ? command.payload.note
+            : "",
+        planDigest: command.payload.planDigest,
+        answers: command.payload.answers ?? {},
+      });
+    }
+    if (command.type === "approve_knowledge") {
+      await store.writeJson("approvals/knowledge.json", {
+        gate: "knowledge",
+        commandId: command.commandId,
+        approvedBy: command.requestedBy,
+        approvedAt: command.requestedAt,
+        note:
+          typeof command.payload.note === "string"
+            ? command.payload.note
+            : "",
+        proposalDigest: command.payload.proposalDigest,
+      });
+    }
+  }
+
+  private async applyPendingOperatorCommands(
+    input: TaskControllerRunInput,
+    state: WorkflowState,
+    plan: CodexPlan | undefined,
+  ): Promise<WorkflowState> {
+    const queue = new OperatorCommandQueue(input.store);
+    for (const command of await queue.pending()) {
+      const result = applyOperatorCommand(
+        state,
+        command,
+        plan,
+        command.type === "approve_knowledge"
+          ? await this.knowledgeProposal(input.store)
+          : undefined,
+      );
+      if (result.status === "applied") {
+        await this.persistAppliedApproval(input.store, command);
+        state = result.state;
+        await this.persist(input.store, state);
+      } else {
+        await input.store.appendWorkflowEvent(
+          "worker",
+          state.revision,
+          "operator_command_rejected",
+          {
+            commandId: command.commandId,
+            type: command.type,
+            reason: result.detail.reason,
+          },
+        );
+      }
+      await queue.complete(
+        command.commandId,
+        result.status,
+        result.detail,
+      );
+    }
+    return state;
+  }
+
   private async enforceDeletionPolicy(
     input: TaskControllerRunInput,
     state: WorkflowState,
@@ -428,25 +521,16 @@ export class TaskController {
       latestReview = await input.store.readJson<ClaudeReview>("review/latest.json");
     }
 
-    while (state.stage !== "completed") {
+    while (true) {
+      state = await this.applyPendingOperatorCommands(input, state, plan);
+      if (state.stage === "completed") {
+        return { status: "completed" };
+      }
       await this.dependencies.hermes.heartbeat(
         input.task.id,
         input.claim.runId,
         `ai-dev stage: ${state.stage}`,
       );
-
-      if (await input.store.exists("operator/pause.json")) {
-        const pause = await input.store.readJson<{ active: boolean }>(
-          "operator/pause.json",
-        );
-        if (pause.active) {
-          state = reduceWorkflowState(state, {
-            type: "BLOCK",
-            reason: "human takeover requested",
-          });
-          return this.block(input, "human takeover requested", state);
-        }
-      }
 
       switch (state.stage) {
         case "context_preparing": {
@@ -824,6 +908,5 @@ export class TaskController {
         }
       }
     }
-    return { status: "completed" };
   }
 }

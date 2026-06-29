@@ -108,16 +108,6 @@ export class ArtifactStore {
     );
   }
 
-  async appendEvent(event: Record<string, unknown>): Promise<void> {
-    const { type, ...payload } = event;
-    await this.appendWorkflowEvent(
-      "operator",
-      0,
-      typeof type === "string" ? type : "legacy_event",
-      payload,
-    );
-  }
-
   async exists(relativePath: string): Promise<boolean> {
     try {
       await stat(this.resolve(relativePath));
