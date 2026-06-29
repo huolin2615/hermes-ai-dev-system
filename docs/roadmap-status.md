@@ -1,5 +1,10 @@
 # 路线实施状态
 
+后续完整演进方案见
+[2026-06-30 Hermes AI 开发调度系统后续路线设计](superpowers/specs/2026-06-30-hermes-ai-dev-roadmap-design.md)。
+下一阶段施工单见
+[V1.1.1 投产硬化实施计划](superpowers/plans/2026-06-30-v1-1-1-production-hardening.md)。
+
 ## 已实现：V1
 
 - Hermes Kanban 任务、显式仓库 worktree、claim/heartbeat/block/complete。
