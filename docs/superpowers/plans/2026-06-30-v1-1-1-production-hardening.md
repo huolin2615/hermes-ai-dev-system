@@ -1263,7 +1263,7 @@ Write `docs/smoke-v1.1.1.md` with:
 
 Mark V1.1.1 complete only if both audits pass. Set V1.2 as the next milestone. Do not mark GitHub, BM25, workflow templates or V2 as implemented.
 
-- [ ] **Step 6: Commit documentation**
+- [x] **Step 6: Commit documentation** — V1.1.1 implementation and acceptance evidence committed in `281b5a6`.
 
 Run:
 
@@ -1281,4 +1281,4 @@ git commit -m "docs: record v1.1.1 production acceptance"
 - [x] No retention or lease code deletes a file or directory.
 - [x] No test requires network, GitHub, push, merge or deployment.
 - [x] The final smoke gate is the only live-model acceptance step.
-- [ ] `env CI=true pnpm check` passes after all commits.
+- [x] `env CI=true pnpm check` passes after all commits.
