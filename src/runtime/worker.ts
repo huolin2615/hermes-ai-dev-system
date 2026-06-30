@@ -1,4 +1,5 @@
 import { ArtifactStore } from "../artifacts/store.js";
+import { TaskErrorStore } from "../artifacts/errors.js";
 import { ClaudeReviewAdapter } from "../claude/adapter.js";
 import { CodexAdapter } from "../codex/adapter.js";
 import type { ProjectConfig } from "../config/project.js";
@@ -11,7 +12,15 @@ import {
 import { KnowledgeWriter } from "../knowledge/writer.js";
 import { VerificationRunner } from "../verification/runner.js";
 import { TaskController, type TaskControllerOutcome } from "../workflow/controller.js";
+import {
+  parseWorkflowState,
+  type WorkflowStage,
+} from "../workflow/state.js";
 import { WorkerHealthStore } from "./health.js";
+import {
+  RepoLeaseHeldError,
+  RepoWriteLease,
+} from "./repo-lease.js";
 
 export interface WorkerRunResult {
   status: "idle" | "completed" | "blocked" | "error";
@@ -28,16 +37,39 @@ export interface ProjectTaskRunner {
   ): Promise<Omit<WorkerRunResult, "durationMs">>;
 }
 
+function workerErrorCode(message: string): string {
+  if (/invalid Claude review output/i.test(message)) {
+    return "CLAUDE_INVALID_OUTPUT";
+  }
+  if (/timed? out|timeout/i.test(message)) {
+    return "STAGE_TIMEOUT";
+  }
+  return "WORKER_STAGE_ERROR";
+}
+
+export async function recordWorkerFailure(
+  store: ArtifactStore,
+  error: unknown,
+): Promise<void> {
+  const reason = error instanceof Error ? error.message : String(error);
+  let stage: WorkflowStage = "context_preparing";
+  if (await store.exists("state.json")) {
+    stage = parseWorkflowState(
+      await store.readJson<unknown>("state.json"),
+    ).stage;
+  }
+  await new TaskErrorStore(store).record({
+    stage,
+    code: workerErrorCode(reason),
+    message: reason,
+  });
+}
+
 class DefaultProjectTaskRunner implements ProjectTaskRunner {
   async run(
     config: ProjectConfig,
     runtimeRoot: string,
   ): Promise<Omit<WorkerRunResult, "durationMs">> {
-    await new GitAdapter().assertRepoReady(
-      config.repo.path,
-      config.repo.baseBranch,
-      config.repo.requireClean,
-    );
     const hermes = new HermesKanbanClient({ board: config.hermes.board });
     const ready = await hermes.listReady(config.hermes.assignee);
     const task = ready[0];
@@ -46,8 +78,32 @@ class DefaultProjectTaskRunner implements ProjectTaskRunner {
       throw new Error(`task ${task.id} must use a worktree workspace`);
     }
 
-    const claim = await hermes.claim(task.id);
-    return this.runClaimed(config, runtimeRoot, hermes, claim);
+    const lease = new RepoWriteLease(runtimeRoot, config.id);
+    let owner;
+    try {
+      owner = await lease.acquire(task.id, process.pid);
+    } catch (error) {
+      if (error instanceof RepoLeaseHeldError) {
+        return { status: "idle", projectId: config.id };
+      }
+      throw error;
+    }
+    try {
+      await new GitAdapter().assertRepoReady(
+        config.repo.path,
+        config.repo.baseBranch,
+        config.repo.requireClean,
+      );
+      const claim = await hermes.claim(task.id);
+      return await this.runClaimed(
+        config,
+        runtimeRoot,
+        hermes,
+        claim,
+      );
+    } finally {
+      await lease.release(owner);
+    }
   }
 
   private async runClaimed(
@@ -108,10 +164,7 @@ class DefaultProjectTaskRunner implements ProjectTaskRunner {
       };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      await store.writeJson("error.json", {
-        message: reason,
-        occurredAt: new Date().toISOString(),
-      });
+      await recordWorkerFailure(store, error);
       await hermes.block({
         taskId: claim.task.id,
         runId: claim.runId,

@@ -10,6 +10,10 @@ import type {
 import type { ProjectConfig } from "../config/project.js";
 import { buildKnowledgeContext } from "../context/knowledge.js";
 import type { ArtifactStore } from "../artifacts/store.js";
+import { TaskErrorStore } from "../artifacts/errors.js";
+import {
+  TaskMetrics,
+} from "../artifacts/metrics.js";
 import type { GitFacts } from "../git/adapter.js";
 import type { KnowledgeWriter } from "../knowledge/writer.js";
 import {
@@ -20,6 +24,7 @@ import {
 import type { VerificationResult } from "../verification/runner.js";
 import {
   digestCodexPlan,
+  digestPlanAnswers,
   LegacyPlanRequiresReplanError,
   parseCodexPlan,
 } from "./plan-contract.js";
@@ -88,6 +93,16 @@ interface KnowledgePort {
   ): Promise<string>;
 }
 
+interface OperatorCommandApplication {
+  version: 1;
+  commandId: string;
+  fromRevision: number;
+  status: "applied" | "rejected";
+  state: WorkflowState;
+  detail: Record<string, unknown>;
+  recordedAt: string;
+}
+
 export interface TaskControllerDependencies {
   codex: CodexPort;
   claude: ClaudePort;
@@ -120,6 +135,40 @@ export interface TaskControllerOutcome {
 
 function usageSummary(value: unknown): unknown {
   return value ?? null;
+}
+
+function metricUsage(value: unknown): {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  claudeCalls: number;
+  claudeNormalizations: number;
+} {
+  const usage =
+    value !== null && typeof value === "object"
+      ? (value as Record<string, unknown>)
+      : {};
+  const number = (...keys: string[]): number => {
+    for (const key of keys) {
+      if (typeof usage[key] === "number") return usage[key];
+    }
+    return 0;
+  };
+  return {
+    inputTokens: number("input_tokens", "inputTokens"),
+    cachedInputTokens: number("cached_input_tokens", "cachedInputTokens"),
+    outputTokens: number("output_tokens", "outputTokens"),
+    reasoningTokens: number(
+      "reasoning_output_tokens",
+      "reasoningTokens",
+    ),
+    claudeCalls: number("claudeCalls", "calls"),
+    claudeNormalizations: number(
+      "claudeNormalizations",
+      "normalizations",
+    ),
+  };
 }
 
 function codexTurnSignal(input: TaskControllerRunInput): AbortSignal {
@@ -244,32 +293,74 @@ export class TaskController {
     );
   }
 
+  private async finishStage(
+    input: TaskControllerRunInput,
+    metrics: TaskMetrics,
+    errors: TaskErrorStore,
+    stage: WorkflowState["stage"],
+    usage?: unknown,
+  ): Promise<void> {
+    if (stage === "blocked" || stage === "completed") return;
+    await metrics.finishStage(stage, metricUsage(usage));
+    await errors.resolveStage(stage, `${stage} succeeded on retry`);
+  }
+
+  private async reportBudgetSignals(
+    input: TaskControllerRunInput,
+    state: WorkflowState,
+    metrics: TaskMetrics,
+  ): Promise<TaskControllerOutcome | null> {
+    const summary = await metrics.summary();
+    for (const signal of summary.budgetSignals) {
+      const marker = `metrics/budget-notices/${signal.metric}.json`;
+      if (await input.store.exists(marker)) continue;
+      await input.store.writeJson(marker, {
+        ...signal,
+        recordedAt: new Date().toISOString(),
+      });
+      await input.store.appendWorkflowEvent(
+        "worker",
+        state.revision,
+        "budget_threshold",
+        signal,
+      );
+      await this.dependencies.hermes.comment(
+        input.task.id,
+        `Budget ${signal.status}: ${signal.metric}`,
+      );
+    }
+    if (summary.budgetStatus !== "exceeded" || state.stage === "blocked") {
+      return null;
+    }
+    const exceeded = summary.budgetSignals
+      .filter((signal) => signal.status === "exceeded")
+      .map((signal) => signal.metric)
+      .join(", ");
+    const blockedState = reduceWorkflowState(state, {
+      type: "BLOCK",
+      reason: `task budget exceeded: ${exceeded}`,
+    });
+    return this.block(
+      input,
+      `task budget exceeded before next stage: ${exceeded}`,
+      blockedState,
+    );
+  }
+
   private async recordMetrics(
-    store: ArtifactStore,
+    input: TaskControllerRunInput,
     status: "blocked" | "completed",
     state?: WorkflowState,
   ): Promise<void> {
-    const timing = await store.readJson<{ startedAt: string }>(
-      "metrics/timing.json",
-    );
-    const planUsage = (await store.exists("codex/plan-usage.json"))
-      ? await store.readJson<unknown>("codex/plan-usage.json")
-      : null;
-    const implementation = (await store.exists("codex/implementation.json"))
-      ? await store.readJson<{ usage?: unknown }>("codex/implementation.json")
-      : null;
-    await store.writeJson("metrics.json", {
+    const summary = await new TaskMetrics(
+      input.store,
+      input.config.budgets,
+    ).summary();
+    await input.store.writeJson("metrics.json", {
       status,
-      startedAt: timing.startedAt,
       updatedAt: new Date().toISOString(),
-      durationMs: Date.now() - new Date(timing.startedAt).getTime(),
       repairAttempts: state?.repairAttempts ?? null,
-      modelUsage: {
-        codexPlan: planUsage,
-        codexImplementation: implementation?.usage ?? null,
-        claudeReview:
-          "Claude CLI structured output does not currently expose stable usage fields",
-      },
+      ...summary,
     });
   }
 
@@ -280,12 +371,14 @@ export class TaskController {
     if (!(await store.exists("approvals/plan.json"))) return null;
     const approval = await store.readJson<{
       planDigest?: string;
+      answersDigest?: string;
       answers?: Record<string, string>;
     }>(
       "approvals/plan.json",
     );
     if (approval.planDigest !== digestCodexPlan(plan)) return null;
     const answers = approval.answers ?? {};
+    if (approval.answersDigest !== digestPlanAnswers(answers)) return null;
     for (const question of plan.questions) {
       if (!answers[question.id]?.trim()) {
         throw new Error(
@@ -352,6 +445,7 @@ export class TaskController {
             ? command.payload.note
             : "",
         planDigest: command.payload.planDigest,
+        answersDigest: command.payload.answersDigest,
         answers: command.payload.answers ?? {},
       });
     }
@@ -370,41 +464,154 @@ export class TaskController {
     }
   }
 
+  private async operatorCommandApplication(
+    store: ArtifactStore,
+    command: OperatorCommand,
+    state: WorkflowState,
+    plan: CodexPlan | undefined,
+  ): Promise<OperatorCommandApplication> {
+    const applicationPath =
+      `operator/applications/${command.commandId}.json`;
+    if (await store.exists(applicationPath)) {
+      const application =
+        await store.readJson<OperatorCommandApplication>(applicationPath);
+      if (
+        application.version !== 1 ||
+        application.commandId !== command.commandId ||
+        !Number.isInteger(application.fromRevision) ||
+        (application.status !== "applied" &&
+          application.status !== "rejected") ||
+        application.detail === null ||
+        typeof application.detail !== "object" ||
+        Array.isArray(application.detail)
+      ) {
+        throw new Error(
+          `invalid operator command application: ${command.commandId}`,
+        );
+      }
+      return {
+        ...application,
+        state: parseWorkflowState(application.state),
+      };
+    }
+
+    const result = applyOperatorCommand(
+      state,
+      command,
+      plan,
+      command.type === "approve_knowledge"
+        ? await this.knowledgeProposal(store)
+        : undefined,
+    );
+    const application: OperatorCommandApplication = {
+      version: 1,
+      commandId: command.commandId,
+      fromRevision: state.revision,
+      status: result.status,
+      state: result.state,
+      detail: result.detail,
+      recordedAt: new Date().toISOString(),
+    };
+    await store.writeJson(applicationPath, application);
+    return application;
+  }
+
+  private async ensureStateChangedEvent(
+    store: ArtifactStore,
+    state: WorkflowState,
+  ): Promise<void> {
+    const alreadyRecorded = (await store.readWorkflowEvents()).some(
+      (event) =>
+        event.type === "state_changed" &&
+        event.stateRevision === state.revision &&
+        event.payload.stage === state.stage,
+    );
+    if (!alreadyRecorded) {
+      await store.appendWorkflowEvent(
+        "worker",
+        state.revision,
+        "state_changed",
+        { stage: state.stage },
+      );
+    }
+  }
+
+  private async ensureCommandRejectedEvent(
+    store: ArtifactStore,
+    command: OperatorCommand,
+    application: OperatorCommandApplication,
+  ): Promise<void> {
+    const alreadyRecorded = (await store.readWorkflowEvents()).some(
+      (event) =>
+        event.type === "operator_command_rejected" &&
+        event.payload.commandId === command.commandId,
+    );
+    if (!alreadyRecorded) {
+      await store.appendWorkflowEvent(
+        "worker",
+        application.fromRevision,
+        "operator_command_rejected",
+        {
+          commandId: command.commandId,
+          type: command.type,
+          reason: application.detail.reason,
+        },
+      );
+    }
+  }
+
   private async applyPendingOperatorCommands(
     input: TaskControllerRunInput,
     state: WorkflowState,
     plan: CodexPlan | undefined,
+    metrics: TaskMetrics,
   ): Promise<WorkflowState> {
     const queue = new OperatorCommandQueue(input.store);
     for (const command of await queue.pending()) {
-      const result = applyOperatorCommand(
-        state,
+      const application = await this.operatorCommandApplication(
+        input.store,
         command,
+        state,
         plan,
-        command.type === "approve_knowledge"
-          ? await this.knowledgeProposal(input.store)
-          : undefined,
       );
-      if (result.status === "applied") {
-        await this.persistAppliedApproval(input.store, command);
-        state = result.state;
-        await this.persist(input.store, state);
+      if (application.status === "applied") {
+        if (state.revision === application.fromRevision) {
+          await this.persistAppliedApproval(input.store, command);
+          state = application.state;
+          await this.persist(input.store, state);
+        } else if (
+          state.revision === application.state.revision &&
+          JSON.stringify(state) === JSON.stringify(application.state)
+        ) {
+          state = application.state;
+          await this.ensureStateChangedEvent(input.store, state);
+        } else {
+          throw new Error(
+            `operator command application conflicts with state: ${command.commandId}`,
+          );
+        }
+        if (command.type === "pause") {
+          await metrics.startOperatorWait("human_takeover");
+        } else {
+          const activeWait = await metrics.activeOperatorWait();
+          if (activeWait) await metrics.finishOperatorWait(activeWait);
+        }
       } else {
-        await input.store.appendWorkflowEvent(
-          "worker",
-          state.revision,
-          "operator_command_rejected",
-          {
-            commandId: command.commandId,
-            type: command.type,
-            reason: result.detail.reason,
-          },
+        if (state.revision !== application.fromRevision) {
+          throw new Error(
+            `rejected operator command conflicts with state: ${command.commandId}`,
+          );
+        }
+        await this.ensureCommandRejectedEvent(
+          input.store,
+          command,
+          application,
         );
       }
       await queue.complete(
         command.commandId,
-        result.status,
-        result.detail,
+        application.status,
+        application.detail,
       );
     }
     return state;
@@ -416,12 +623,24 @@ export class TaskController {
     plan: CodexPlan,
     facts: GitFacts,
   ): Promise<TaskControllerOutcome | null> {
-    if (facts.deletedFiles.length === 0) return null;
+    if (facts.deletedFiles.length === 0) {
+      await this.resolveDeletionRequest(
+        input.store,
+        "current Git evidence contains no deletion",
+      );
+      return null;
+    }
     const deletionApproved =
       facts.deletedFiles.length === 1 &&
       facts.deletedFiles.every((file) => plan.fileDeletions.includes(file)) &&
       (await this.planApprovalAnswers(input.store, plan)) !== null;
-    if (deletionApproved) return null;
+    if (deletionApproved) {
+      await this.resolveDeletionRequest(
+        input.store,
+        "one exact deletion is bound to the approved plan",
+      );
+      return null;
+    }
 
     await this.dependencies.git.restoreDeleted(
       input.claim.workspacePath,
@@ -452,13 +671,42 @@ export class TaskController {
     );
   }
 
+  private async resolveDeletionRequest(
+    store: ArtifactStore,
+    resolution: string,
+  ): Promise<void> {
+    if (
+      !(await store.exists("deletion-request.json")) ||
+      (await store.exists("deletion-resolution.json"))
+    ) {
+      return;
+    }
+    await store.writeJson("deletion-resolution.json", {
+      resolution,
+      resolvedAt: new Date().toISOString(),
+    });
+  }
+
   private async block(
     input: TaskControllerRunInput,
     reason: string,
     persistState?: WorkflowState,
   ): Promise<TaskControllerOutcome> {
     if (persistState) await this.persist(input.store, persistState);
-    await this.recordMetrics(input.store, "blocked", persistState);
+    const effectiveState =
+      persistState ??
+      ((await input.store.exists("state.json"))
+        ? parseWorkflowState(
+            await input.store.readJson<unknown>("state.json"),
+          )
+        : undefined);
+    if (effectiveState?.stage === "blocked") {
+      const metrics = new TaskMetrics(input.store, input.config.budgets);
+      if (!(await metrics.activeOperatorWait())) {
+        await metrics.startOperatorWait("blocked");
+      }
+    }
+    await this.recordMetrics(input, "blocked", effectiveState);
     await this.dependencies.hermes.comment(input.task.id, `BLOCKED: ${reason}`);
     await this.dependencies.hermes.block({
       taskId: input.task.id,
@@ -470,11 +718,8 @@ export class TaskController {
   }
 
   async run(input: TaskControllerRunInput): Promise<TaskControllerOutcome> {
-    if (!(await input.store.exists("metrics/timing.json"))) {
-      await input.store.writeJson("metrics/timing.json", {
-        startedAt: new Date().toISOString(),
-      });
-    }
+    const metrics = new TaskMetrics(input.store, input.config.budgets);
+    const errors = new TaskErrorStore(input.store);
     let state = await this.readState(
       input.store,
       input.task.id,
@@ -522,9 +767,26 @@ export class TaskController {
     }
 
     while (true) {
-      state = await this.applyPendingOperatorCommands(input, state, plan);
+      state = await this.applyPendingOperatorCommands(
+        input,
+        state,
+        plan,
+        metrics,
+      );
       if (state.stage === "completed") {
         return { status: "completed" };
+      }
+      const budgetBlock = await this.reportBudgetSignals(
+        input,
+        state,
+        metrics,
+      );
+      if (budgetBlock) return budgetBlock;
+      if (
+        state.stage !== "blocked" &&
+        state.stage !== "awaiting_plan_approval"
+      ) {
+        await metrics.startStage(state.stage);
       }
       await this.dependencies.hermes.heartbeat(
         input.task.id,
@@ -545,6 +807,12 @@ export class TaskController {
           await input.store.writeText("context/retrieved-context.md", context.markdown);
           await input.store.writeJson("context/manifest.json", context.entries);
           await input.store.writeJson("context/project-config.json", input.config);
+          await this.finishStage(
+            input,
+            metrics,
+            errors,
+            "context_preparing",
+          );
           state = reduceWorkflowState(state, { type: "CONTEXT_PREPARED" });
           await this.persist(input.store, state);
           break;
@@ -600,13 +868,22 @@ export class TaskController {
                 : []),
             ].join("\n"),
           );
+          await this.finishStage(
+            input,
+            metrics,
+            errors,
+            "planning",
+            result.usage,
+          );
           if (plan.capabilities.externalWrite) {
+            await metrics.startOperatorWait("plan");
             return this.block(
               input,
               "external writes are not supported in V1.1.1",
             );
           }
           if (requiresApproval) {
+            await metrics.startOperatorWait("plan");
             return this.block(
               input,
               [
@@ -628,6 +905,9 @@ export class TaskController {
             !plan ||
             (await this.planApprovalAnswers(input.store, plan)) === null
           ) {
+            if (!(await metrics.activeOperatorWait())) {
+              await metrics.startOperatorWait("plan");
+            }
             return this.block(input, "plan approval required");
           }
           state = reduceWorkflowState(state, { type: "APPROVED", gate: "plan" });
@@ -663,6 +943,13 @@ export class TaskController {
           );
           await input.store.writeJson("git/facts.json", facts);
           await input.store.writeText("git/diff.patch", facts.diff);
+          await this.finishStage(
+            input,
+            metrics,
+            errors,
+            "implementing",
+            result.usage,
+          );
           const deletionBlock = await this.enforceDeletionPolicy(
             input,
             state,
@@ -697,6 +984,7 @@ export class TaskController {
               : "VERIFICATION_FAILED",
           });
           await this.persist(input.store, state);
+          await this.finishStage(input, metrics, errors, "verifying");
           if (state.stage === "blocked") {
             return this.block(input, state.blockedReason ?? "verification failed");
           }
@@ -727,6 +1015,13 @@ export class TaskController {
           await input.store.writeJson("codex/implementation.json", result);
           state = reduceWorkflowState(state, { type: "FIX_DONE" });
           await this.persist(input.store, state);
+          await this.finishStage(
+            input,
+            metrics,
+            errors,
+            "fixing",
+            result.usage,
+          );
           break;
         }
         case "reviewing": {
@@ -759,6 +1054,13 @@ export class TaskController {
               latestReview.verdict === "BLOCK" ? "REVIEW_BLOCKED" : "REVIEW_PASSED",
           });
           await this.persist(input.store, state);
+          await this.finishStage(
+            input,
+            metrics,
+            errors,
+            "reviewing",
+            latestReview.execution,
+          );
           if (state.stage === "blocked") {
             return this.block(input, state.blockedReason ?? "review failed");
           }
@@ -811,6 +1113,8 @@ export class TaskController {
             await input.store.writeJson("knowledge/proposal.json", {
               path: proposalPath,
             });
+            await this.finishStage(input, metrics, errors, "knowledge");
+            await metrics.startOperatorWait("knowledge");
             state = reduceWorkflowState(state, {
               type: "BLOCK",
               reason: "knowledge approval required",
@@ -837,6 +1141,7 @@ export class TaskController {
               path: promotedPath,
             });
           }
+          await this.finishStage(input, metrics, errors, "knowledge");
           state = reduceWorkflowState(state, { type: "KNOWLEDGE_HANDLED" });
           await this.persist(input.store, state);
           break;
@@ -875,7 +1180,8 @@ export class TaskController {
             "summary.md",
             `# ${input.task.title}\n\n${summary}\n\nCommit: \`${commit}\`\n`,
           );
-          await this.recordMetrics(input.store, "completed", state);
+          await this.finishStage(input, metrics, errors, "finalizing");
+          await this.recordMetrics(input, "completed", state);
           await this.dependencies.hermes.complete({
             taskId: input.task.id,
             runId: input.claim.runId,

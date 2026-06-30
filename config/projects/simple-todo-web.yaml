@@ -1,13 +1,13 @@
 schema_version: 2
-id: my-project
+id: simple-todo-web
 
 repo:
-  path: /absolute/path/to/repository
+  path: /Users/huolin/Documents/知识库搭建/demo/simple-todo-web
   base_branch: main
   require_clean: true
 
 hermes:
-  board: my-project
+  board: simple-todo-web
   assignee: ai-dev
 
 codex:
@@ -32,18 +32,18 @@ retention:
 
 verification:
   commands:
-    - id: typecheck
-      argv: [pnpm, typecheck]
+    - id: tests
+      argv: [node, --test]
       required: true
-      timeout_seconds: 600
-    - id: test
-      argv: [pnpm, test]
+      timeout_seconds: 120
+    - id: app-syntax
+      argv: [node, --check, src/app.js]
       required: true
-      timeout_seconds: 900
+      timeout_seconds: 30
 
 knowledge:
   vault_path: /Users/huolin/Documents/Obsidian Vault
-  project_path: AI Dev/Projects/my-project
+  project_path: AI Dev/Projects/simple-todo-web
   task_logs: auto
   reusable_knowledge: ask
 

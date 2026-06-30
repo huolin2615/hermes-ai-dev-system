@@ -26,7 +26,14 @@ export const claudeReviewSchema = z.strictObject({
   finalSummary: z.string(),
 });
 
-export type ClaudeReview = z.infer<typeof claudeReviewSchema>;
+export interface ClaudeReviewExecution {
+  calls: number;
+  normalizations: number;
+}
+
+export type ClaudeReview = z.infer<typeof claudeReviewSchema> & {
+  execution?: ClaudeReviewExecution;
+};
 export type ReviewCommandExecutor = (
   options: RunCommandOptions,
 ) => Promise<CommandResult>;
@@ -139,7 +146,11 @@ export class ClaudeReviewAdapter {
 
     let candidate = reviewCandidate(result.stdout);
     let parsed = claudeReviewSchema.safeParse(candidate);
+    let calls = 1;
+    let normalizations = 0;
     if (!parsed.success && typeof candidate === "string") {
+      calls += 1;
+      normalizations += 1;
       const normalized = await this.execute({
         ...command,
         input: [
@@ -170,6 +181,9 @@ export class ClaudeReviewAdapter {
           .join("; ")}`,
       );
     }
-    return normalizeReviewVerdict(parsed.data);
+    return {
+      ...normalizeReviewVerdict(parsed.data),
+      execution: { calls, normalizations },
+    };
   }
 }

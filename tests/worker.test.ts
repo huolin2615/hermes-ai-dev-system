@@ -4,12 +4,16 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { ArtifactStore } from "../src/artifacts/store.js";
+import { TaskErrorStore } from "../src/artifacts/errors.js";
 import type { ProjectConfig } from "../src/config/project.js";
 import { WorkerHealthStore } from "../src/runtime/health.js";
 import {
   AiDevWorker,
+  recordWorkerFailure,
   type ProjectTaskRunner,
 } from "../src/runtime/worker.js";
+import { createWorkflowState } from "../src/workflow/state.js";
 
 const config = `
 schema_version: 1
@@ -94,4 +98,26 @@ test("one invalid project does not starve ready tasks in another project", async
 
   assert.equal(result.status, "completed");
   assert.equal(result.projectId, "orders");
+});
+
+test("records stage-scoped worker errors without overwriting legacy error.json", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ai-dev-worker-"));
+  const store = new ArtifactStore(root, "crm", "t_1");
+  await store.writeJson("state.json", {
+    ...createWorkflowState("t_1", "crm", 2),
+    stage: "reviewing",
+  });
+  await store.writeJson("error.json", { message: "legacy error" });
+
+  await recordWorkerFailure(
+    store,
+    new Error("invalid Claude review output: Expected object."),
+  );
+
+  const active = await new TaskErrorStore(store).active();
+  assert.equal(active[0]?.stage, "reviewing");
+  assert.equal(active[0]?.code, "CLAUDE_INVALID_OUTPUT");
+  assert.deepEqual(await store.readJson("error.json"), {
+    message: "legacy error",
+  });
 });

@@ -40,10 +40,12 @@
 - Modify: `src/git/adapter.ts`
 - Modify: `src/claude/adapter.ts`
 - Modify: `src/workflow/controller.ts`
+- Create: `src/workflow/review-policy.ts`
 - Modify: `tests/git-adapter.test.ts`
 - Modify: `tests/claude-adapter.test.ts`
+- Modify: `tests/task-controller.test.ts`
 
-- [ ] **Step 1: Add committed rename and deletion evidence tests**
+- [x] **Step 1: Add committed rename and deletion evidence tests**
 
 Add tests that exercise `collect(cwd, "main")` with null-separated Git output:
 
@@ -51,11 +53,8 @@ Add tests that exercise `collect(cwd, "main")` with null-separated Git output:
 test("classifies committed renames against the configured base branch", async () => {
   const adapter = new GitAdapter(async ({ argv }) => {
     if (argv.includes("status")) return result("");
-    if (argv.includes("--diff-filter=D")) {
-      return result("src/old-name.ts\u0000");
-    }
-    if (argv.includes("--name-only")) {
-      return result("src/new-name.ts\u0000src/old-name.ts\u0000");
+    if (argv.includes("--name-status")) {
+      return result("R100\u0000src/old-name.ts\u0000src/new-name.ts\u0000");
     }
     return result("diff --git a/src/old-name.ts b/src/new-name.ts\n");
   });
@@ -66,7 +65,11 @@ test("classifies committed renames against the configured base branch", async ()
     "src/new-name.ts",
     "src/old-name.ts",
   ]);
-  assert.deepEqual(facts.deletedFiles, ["src/old-name.ts"]);
+  assert.deepEqual(facts.deletedFiles, []);
+  assert.deepEqual(facts.renamedFiles, [{
+    from: "src/old-name.ts",
+    to: "src/new-name.ts",
+  }]);
 });
 ```
 
@@ -79,7 +82,7 @@ node --test .test-dist/tests/git-adapter.test.js
 
 Expected: the new rename test fails until base-ref collection is complete.
 
-- [ ] **Step 2: Complete base-ref collection without test casts**
+- [x] **Step 2: Complete base-ref collection without test casts**
 
 Expose this exact public method:
 
@@ -91,14 +94,17 @@ Collect and merge:
 
 ```ts
 git status --porcelain=v1 -z
-git diff --name-only -z <baseRef>
-git diff --diff-filter=D --name-only -z <baseRef>
+git diff --name-status -z --find-renames <baseRef>
 git diff --binary <baseRef>
 ```
 
-Reject truncated output. Pass `config.repo.baseBranch` from every controller collection and deletion restoration call. Remove the temporary `as unknown as` cast from the test.
+Reject truncated or malformed rename output. Record explicit `R` entries in
+`renamedFiles`, include both paths in `changedFiles`, and keep both paths out of
+`deletedFiles`; only explicit `D` entries enter the deletion approval gate. Pass
+`config.repo.baseBranch` from every controller collection and deletion
+restoration call. Remove the temporary `as unknown as` cast from the test.
 
-- [ ] **Step 3: Add Claude semantic consistency tests**
+- [x] **Step 3: Add Claude semantic consistency tests**
 
 Add:
 
@@ -136,7 +142,7 @@ test("turns pass-with-comments plus blockers into BLOCK", async () => {
 
 Also preserve tests for direct objects, JSON-encoded strings, fenced JSON and one normalization retry.
 
-- [ ] **Step 4: Extract deterministic review normalization**
+- [x] **Step 4: Extract deterministic review normalization**
 
 Create `src/workflow/review-policy.ts`:
 
@@ -151,7 +157,7 @@ export function normalizeReviewVerdict(review: ClaudeReview): ClaudeReview {
 
 Apply it after Zod validation in `ClaudeReviewAdapter`. Do not perform a third Claude call. If the initial parse and single normalization call both fail, throw with the schema issues and persist the raw CLI output through the worker error path.
 
-- [ ] **Step 5: Verify and commit only the smoke-fix files**
+- [x] **Step 5: Verify and commit only the smoke-fix files**
 
 Run:
 
@@ -175,11 +181,16 @@ git commit -m "fix: harden git evidence and claude review parsing"
 - Modify: `src/codex/adapter.ts`
 - Modify: `src/operator/controls.ts`
 - Modify: `src/workflow/controller.ts`
+- Modify: `src/runtime/service.ts`
+- Modify: `src/mcp.ts`
+- Modify: `src/cli.ts`
 - Test: `tests/plan-contract.test.ts`
 - Modify: `tests/codex-adapter.test.ts`
 - Modify: `tests/operator-controls.test.ts`
+- Modify: `tests/task-controller.test.ts`
+- Modify: `tests/mcp.test.ts`
 
-- [ ] **Step 1: Write plan migration and validation tests**
+- [x] **Step 1: Write plan migration and validation tests**
 
 Create tests for:
 
@@ -229,7 +240,7 @@ test("rejects more than one requested deletion", () => {
 
 Run the new test and confirm failure because `parseCodexPlan` does not exist.
 
-- [ ] **Step 2: Implement the versioned plan contract**
+- [x] **Step 2: Implement the versioned plan contract**
 
 Export:
 
@@ -271,7 +282,7 @@ const fileDeletions: string[] = [];
 
 Do not infer approval from descriptive operation sentences. A persisted v1 plan that requested deletion must return to planning and produce a v2 plan with one exact deletion path.
 
-- [ ] **Step 3: Update Codex prompts and adapter output**
+- [x] **Step 3: Update Codex prompts and adapter output**
 
 Use `codexPlanJsonSchema()` in `CodexAdapter.plan`. Add this instruction to the plan and implementation prompts:
 
@@ -283,13 +294,14 @@ Declare requested network, dependency installation, external writes, and one exa
 
 The controller must reject `externalWrite=true` in V1.1.1 even after plan approval.
 
-- [ ] **Step 4: Bind required question answers to approval**
+- [x] **Step 4: Bind required question answers to approval**
 
 Change plan approval input:
 
 ```ts
 interface PlanApprovalPayload {
   planDigest: string;
+  answersDigest: string;
   approvedBy: string;
   approvedAt: string;
   answers: Record<string, string>;
@@ -307,8 +319,10 @@ for (const question of plan.questions) {
 ```
 
 Append the answers to the implementation prompt under `# Approved answers`.
+Compute `answersDigest` from the key-sorted answer map and reject the command or
+persisted approval when the digest does not match.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run:
 
@@ -331,8 +345,9 @@ git commit -m "feat: add typed codex plan approvals"
 - Modify: `src/workflow/controller.ts`
 - Modify: `tests/workflow-state.test.ts`
 - Modify: `tests/artifacts.test.ts`
+- Modify: `tests/task-controller.test.ts`
 
-- [ ] **Step 1: Write v1 migration and event uniqueness tests**
+- [x] **Step 1: Write v1 migration and event uniqueness tests**
 
 Add:
 
@@ -364,7 +379,7 @@ test("event identity does not depend on process-local sequence", async () => {
 });
 ```
 
-- [ ] **Step 2: Implement state v2**
+- [x] **Step 2: Implement state v2**
 
 Export:
 
@@ -397,7 +412,7 @@ return {
 };
 ```
 
-- [ ] **Step 3: Replace sequence events with UUID events**
+- [x] **Step 3: Replace sequence events with UUID events**
 
 Add to `ArtifactStore`:
 
@@ -429,11 +444,11 @@ eventId: `legacy-${record.timestamp}-${record.sequence ?? index}`
 
 Sort by timestamp and then eventId.
 
-- [ ] **Step 4: Integrate state parsing and events**
+- [x] **Step 4: Integrate state parsing and events**
 
 `TaskController.readState` must call `parseWorkflowState`. `persist` writes state first and then appends an event with the new revision. Do not rewrite old `events.jsonl`.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run:
 
@@ -457,11 +472,14 @@ git commit -m "feat: version workflow state and events"
 - Modify: `src/workflow/controller.ts`
 - Modify: `src/mcp.ts`
 - Modify: `src/cli.ts`
+- Modify: `src/artifacts/store.ts`
+- Modify: `README.md`
 - Test: `tests/operator-commands.test.ts`
+- Test: `tests/cli.test.ts`
 - Modify: `tests/operator-controls.test.ts`
 - Modify: `tests/task-controller.test.ts`
 
-- [ ] **Step 1: Write queue ordering and idempotency tests**
+- [x] **Step 1: Write queue ordering and idempotency tests**
 
 Create:
 
@@ -489,7 +507,7 @@ test("returns only commands without a result in stable order", async () => {
 
 Run and confirm failure because the queue does not exist.
 
-- [ ] **Step 2: Implement immutable command and result files**
+- [x] **Step 2: Implement immutable command and result files**
 
 Export:
 
@@ -533,7 +551,7 @@ export class OperatorCommandQueue {
 
 Write commands to `operator/commands/<commandId>.json` and results to `operator/results/<commandId>.json`. Never delete either file.
 
-- [ ] **Step 3: Make controls enqueue only**
+- [x] **Step 3: Make controls enqueue only**
 
 `OperatorControls` must not read or write `state.json`. Its methods validate input, snapshot required digests, and enqueue commands.
 
@@ -545,7 +563,7 @@ Plan approval CLI adds:
 
 The JSON object maps question IDs to non-empty answers. An empty questions list accepts an omitted answers file.
 
-- [ ] **Step 4: Consume commands at workflow boundaries**
+- [x] **Step 4: Consume commands at workflow boundaries**
 
 At the top of every controller loop:
 
@@ -573,11 +591,11 @@ for (const command of await commandQueue.pending()) {
 
 Repeated controller runs see the result and do not reapply a command. Invalid stage commands produce a rejected result and leave state unchanged.
 
-- [ ] **Step 5: Update service and MCP responses**
+- [x] **Step 5: Update service and MCP responses**
 
 Return `{ commandId, status: "queued" }` from operator actions. Hermes unblock happens only after a valid resume/retry/approval command is queued.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 Run:
 
@@ -600,7 +618,7 @@ git commit -m "feat: queue immutable operator commands"
 - Modify: `config/projects/simple-todo-web.yaml`
 - Modify: `tests/config.test.ts`
 
-- [ ] **Step 1: Write version compatibility tests**
+- [x] **Step 1: Write version compatibility tests**
 
 Add:
 
@@ -631,7 +649,7 @@ test("rejects a warning ratio outside zero and one", () => {
 });
 ```
 
-- [ ] **Step 2: Extend the normalized project config**
+- [x] **Step 2: Extend the normalized project config**
 
 Normalize both file versions to:
 
@@ -654,7 +672,7 @@ interface ProjectConfig {
 
 Use the defaults asserted above. Require `warnBeforeDays < taskArtifactsDays`.
 
-- [ ] **Step 3: Update examples**
+- [x] **Step 3: Update examples**
 
 Add:
 
@@ -672,7 +690,7 @@ retention:
 
 Do not change repository paths or verification commands in `simple-todo-web.yaml`.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit** — verification passed; included in the consolidated V1.1.1 hardening commit.
 
 Run:
 
@@ -698,8 +716,10 @@ git commit -m "feat: configure task budgets and retention"
 - Test: `tests/errors.test.ts`
 - Test: `tests/metrics.test.ts`
 - Modify: `tests/task-controller.test.ts`
+- Modify: `tests/worker.test.ts`
+- Modify: `tests/mcp.test.ts`
 
-- [ ] **Step 1: Write append-only error lifecycle tests**
+- [x] **Step 1: Write append-only error lifecycle tests**
 
 Create:
 
@@ -723,7 +743,7 @@ test("completed recovery resolves the prior active error", async () => {
 });
 ```
 
-- [ ] **Step 2: Implement error records**
+- [x] **Step 2: Implement error records**
 
 Write immutable records to:
 
@@ -756,7 +776,7 @@ export class TaskErrorStore {
 }
 ```
 
-- [ ] **Step 3: Write stage metrics and budget tests**
+- [x] **Step 3: Write stage metrics and budget tests**
 
 Add:
 
@@ -776,7 +796,7 @@ test("excludes operator wait time from active duration", async () => {
 });
 ```
 
-- [ ] **Step 4: Implement stage metrics and budget evaluation**
+- [x] **Step 4: Implement stage metrics and budget evaluation**
 
 Use immutable stage attempt records:
 
@@ -792,6 +812,8 @@ interface StageMetric {
   cachedInputTokens: number;
   outputTokens: number;
   reasoningTokens: number;
+  claudeCalls: number;
+  claudeNormalizations: number;
 }
 ```
 
@@ -809,6 +831,8 @@ export class TaskMetrics {
       cachedInputTokens?: number;
       outputTokens: number;
       reasoningTokens?: number;
+      claudeCalls?: number;
+      claudeNormalizations?: number;
     },
   ): Promise<StageMetric>;
   startOperatorWait(gate: string): Promise<void>;
@@ -816,6 +840,9 @@ export class TaskMetrics {
   summary(): Promise<{
     activeDurationMs: number;
     operatorWaitDurationMs: number;
+    claudeCalls: number;
+    claudeNormalizations: number;
+    verificationDurationMs: number;
     budgetStatus: BudgetStatus;
   }>;
 }
@@ -823,7 +850,7 @@ export class TaskMetrics {
 
 Check budget after each stage. `warning` appends an event and Hermes comment once per metric type. `exceeded` blocks before starting the next stage.
 
-- [ ] **Step 5: Integrate worker errors and status**
+- [x] **Step 5: Integrate worker errors and status**
 
 Worker exceptions call `TaskErrorStore.record`. A successful retry of the same stage resolves active errors for that stage. `TaskStatus` returns:
 
@@ -834,7 +861,7 @@ activeDurationMs: number;
 operatorWaitDurationMs: number;
 ```
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit** — verification passed; included in the consolidated V1.1.1 hardening commit.
 
 Run:
 
@@ -861,7 +888,7 @@ git commit -m "feat: track task errors metrics and budgets"
 - Modify: `tests/worker.test.ts`
 - Modify: `tests/doctor.test.ts`
 
-- [ ] **Step 1: Write lease contention and release tests**
+- [x] **Step 1: Write lease contention and release tests**
 
 Create:
 
@@ -881,7 +908,7 @@ test("only one task can own a repository write lease", async () => {
 
 Assert that release uses rename and leaves `repo.lease.available` present.
 
-- [ ] **Step 2: Implement the atomic rename lease**
+- [x] **Step 2: Implement the atomic rename lease**
 
 Store leases under:
 
@@ -906,17 +933,20 @@ export interface RepoLeaseOwner {
 export class RepoWriteLease {
   acquire(taskId: string, pid: number): Promise<RepoLeaseOwner>;
   release(owner: RepoLeaseOwner): Promise<void>;
-  diagnose(): Promise<LeaseDiagnosis>;
+  diagnose(taskRunActive?: boolean): Promise<LeaseDiagnosis>;
   reclaimStale(
     owner: RepoLeaseOwner,
     approvedBy: string,
+    taskRunActive: boolean,
   ): Promise<RepoLeaseOwner>;
 }
 ```
 
-`reclaimStale` first proves `processAlive=false`, writes an immutable audit record under `leases/reclaims/<uuid>.json`, then renames the exact owner file back to `repo.lease.available`.
+`reclaimStale` first proves `processAlive=false` and the Hermes task run is not
+active, writes an immutable audit record under `leases/reclaims/<uuid>.json`,
+then renames the exact owner file back to `repo.lease.available`.
 
-- [ ] **Step 3: Integrate worker acquisition**
+- [x] **Step 3: Integrate worker acquisition**
 
 Order:
 
@@ -928,7 +958,7 @@ Order:
 
 If claim fails, release immediately. If lease is held, leave the task ready and continue scanning another project.
 
-- [ ] **Step 4: Add doctor stale reporting**
+- [x] **Step 4: Add doctor stale reporting**
 
 Doctor reports:
 
@@ -942,9 +972,10 @@ interface LeaseDiagnosis {
 }
 ```
 
-`stale=true` only when the PID does not exist. Doctor never reclaims the lease.
+`stale=true` only when the PID does not exist and Hermes confirms the task run is
+not active. Doctor never reclaims the lease.
 
-- [ ] **Step 5: Add explicit stale lease reclaim**
+- [x] **Step 5: Add explicit stale lease reclaim**
 
 Add:
 
@@ -955,9 +986,10 @@ node dist/cli.js lease-reclaim \
   --by huolin
 ```
 
-The command rejects a live PID, a mismatched owner task, or a non-stale diagnosis. It never deletes a lock file.
+The command rejects a live PID, an active Hermes run, a mismatched owner task,
+or a non-stale diagnosis. It never deletes a lock file.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit** — verification passed; included in the consolidated V1.1.1 hardening commit.
 
 Run:
 
@@ -983,7 +1015,7 @@ git commit -m "feat: serialize repository write tasks"
 - Test: `tests/retention.test.ts`
 - Test: `tests/audit.test.ts`
 
-- [ ] **Step 1: Write retention classification tests**
+- [x] **Step 1: Write retention classification tests**
 
 Add:
 
@@ -1002,7 +1034,7 @@ test("warns before expiry without creating a cleanup request", async () => {
 
 No retention function may call `CleanupApprovalStore.execute`.
 
-- [ ] **Step 2: Implement retention reporting**
+- [x] **Step 2: Implement retention reporting**
 
 Return:
 
@@ -1016,7 +1048,7 @@ interface RetentionStatus {
 
 `doctor` lists warnings and expired task roots. The operator must still create one cleanup request for one exact worktree or file.
 
-- [ ] **Step 3: Write invariant audit tests**
+- [x] **Step 3: Write invariant audit tests**
 
 Add:
 
@@ -1031,7 +1063,7 @@ test("fails a completed task with active errors or pending commands", async () =
 });
 ```
 
-- [ ] **Step 4: Implement task audit**
+- [x] **Step 4: Implement task audit**
 
 Audit:
 
@@ -1079,7 +1111,7 @@ node dist/cli.js audit --project simple-todo-web --task <task-id>
 
 Exit 0 only when `report.ok=true`.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit** — verification passed; included in the consolidated V1.1.1 hardening commit.
 
 Run:
 
@@ -1100,7 +1132,7 @@ git commit -m "feat: audit task invariants and retention"
 - Create: `tests/recovery.test.ts`
 - Modify: `tests/task-controller.test.ts`
 
-- [ ] **Step 1: Build a fault-injectable dependency harness**
+- [x] **Step 1: Build a fault-injectable dependency harness**
 
 Use:
 
@@ -1121,7 +1153,7 @@ class CrashOnce {
 
 Adapters count calls and persist their normal artifacts before the injected crash point.
 
-- [ ] **Step 2: Test restart from every durable stage**
+- [x] **Step 2: Test restart from every durable stage**
 
 Generate one test case for:
 
@@ -1144,11 +1176,11 @@ For each stage:
 4. assert completed
 5. assert implementation, Review, knowledge promotion and commit counts never exceed their valid attempt counts
 
-- [ ] **Step 3: Test command replay**
+- [x] **Step 3: Test command replay**
 
 Queue the same command file, restart before writing its result, and verify state revision advances once. The second run writes or recognizes the same command result without applying the transition twice.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit** — verification passed; included in the consolidated V1.1.1 hardening commit.
 
 Run:
 
@@ -1172,7 +1204,7 @@ git commit -m "test: cover workflow crash recovery"
 - Modify: `docs/roadmap-status.md`
 - Create: `docs/smoke-v1.1.1.md`
 
-- [ ] **Step 1: Run the complete automated gate**
+- [x] **Step 1: Run the complete automated gate**
 
 Run:
 
@@ -1189,7 +1221,7 @@ Expected:
 - doctor reports compatible Hermes, Codex SDK/CLI, Claude, Node and project config
 - an idle worker may be absent; record that as operational status, not a compatibility failure
 
-- [ ] **Step 2: Run smoke task A**
+- [x] **Step 2: Run smoke task A**
 
 Submit a small low-risk feature to `simple-todo-web` using a unique idempotency key. Run the worker until it either awaits plan approval or completes. If approval is requested, answer every plan question through `--answers-file`.
 
@@ -1201,7 +1233,7 @@ Acceptance:
 - one controller-owned local commit is recorded
 - no push, PR, merge or deployment occurs
 
-- [ ] **Step 3: Run smoke task B**
+- [x] **Step 3: Run smoke task B**
 
 Submit a second independent low-risk feature with a new idempotency key and repeat the same flow.
 
@@ -1213,7 +1245,7 @@ Acceptance:
 - active error list is empty
 - stage metrics separate active and operator-wait time
 
-- [ ] **Step 4: Document exact evidence**
+- [x] **Step 4: Document exact evidence**
 
 Write `docs/smoke-v1.1.1.md` with:
 
@@ -1227,7 +1259,7 @@ Write `docs/smoke-v1.1.1.md` with:
 - approvals requested
 - confirmation that no remote write occurred
 
-- [ ] **Step 5: Update route status**
+- [x] **Step 5: Update route status**
 
 Mark V1.1.1 complete only if both audits pass. Set V1.2 as the next milestone. Do not mark GitHub, BM25, workflow templates or V2 as implemented.
 
@@ -1242,11 +1274,11 @@ git commit -m "docs: record v1.1.1 production acceptance"
 
 ## Final self-review checklist
 
-- [ ] Every design requirement in `2026-06-30-hermes-ai-dev-roadmap-design.md` section 3 maps to a task above.
-- [ ] Version 1 config, state and event artifacts remain readable.
-- [ ] No operator code path writes state directly.
-- [ ] No Codex prompt asks Codex to commit.
-- [ ] No retention or lease code deletes a file or directory.
-- [ ] No test requires network, GitHub, push, merge or deployment.
-- [ ] The final smoke gate is the only live-model acceptance step.
+- [x] Every design requirement in `2026-06-30-hermes-ai-dev-roadmap-design.md` section 3 maps to a task above.
+- [x] Version 1 config, state and event artifacts remain readable.
+- [x] No operator code path writes state directly.
+- [x] No Codex prompt asks Codex to commit.
+- [x] No retention or lease code deletes a file or directory.
+- [x] No test requires network, GitHub, push, merge or deployment.
+- [x] The final smoke gate is the only live-model acceptance step.
 - [ ] `env CI=true pnpm check` passes after all commits.

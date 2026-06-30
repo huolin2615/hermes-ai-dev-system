@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { ArtifactStore } from "../src/artifacts/store.js";
+import { TaskErrorStore } from "../src/artifacts/errors.js";
 import type { ClaudeReview } from "../src/claude/adapter.js";
 import type {
   CodexImplementationResult,
@@ -152,6 +153,11 @@ function dependencies(overrides: Partial<TaskControllerDependencies> = {}) {
 test("runs the low-risk local workflow to a reviewed local commit", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "ai-dev-controller-"));
   const store = new ArtifactStore(root, "crm", "t_1");
+  await new TaskErrorStore(store).record({
+    stage: "planning",
+    code: "CODEX_TIMEOUT",
+    message: "Prior planning attempt timed out.",
+  });
   const { value, calls } = dependencies();
   const controller = new TaskController(value);
 
@@ -192,6 +198,7 @@ test("runs the low-risk local workflow to a reviewed local commit", async () => 
     (await store.readJson<{ status: string }>("metrics.json")).status,
     "completed",
   );
+  assert.deepEqual(await new TaskErrorStore(store).active(), []);
   const invalidCommand = await new OperatorControls(store).reprepare("huolin");
   assert.equal((await controller.run(runInput)).status, "completed");
   assert.equal(calls.implement, 1);
@@ -240,6 +247,73 @@ test("blocks a high-risk plan before Codex can modify the worktree", async () =>
   assert.equal(
     (await store.readJson<{ stage: string }>("state.json")).stage,
     "awaiting_plan_approval",
+  );
+});
+
+test("blocks before implementation when a completed stage exceeds budget", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ai-dev-controller-"));
+  const store = new ArtifactStore(root, "crm", "t_budget");
+  const { value, calls } = dependencies({
+    codex: {
+      async plan() {
+        return {
+          threadId: "thread-budget",
+          plan,
+          usage: {
+            input_tokens: 101,
+            cached_input_tokens: 0,
+            output_tokens: 1,
+            reasoning_output_tokens: 0,
+          },
+        };
+      },
+      async implement() {
+        calls.implement += 1;
+        return { ...implementation, usage: null };
+      },
+      desktopThreadUrl(id) {
+        return `codex://threads/${id}`;
+      },
+    },
+  });
+  const config = parseProjectConfig(configInput);
+  config.budgets = {
+    maxActiveMinutes: 60,
+    maxCodexInputTokens: 100,
+    maxCodexOutputTokens: 100,
+    warningRatio: 0.8,
+  };
+  const input = {
+    config,
+    task: {
+      id: "t_budget",
+      title: "Budget guard",
+      requirement: "Stop before implementation.",
+    },
+    claim: { runId: 20, workspacePath: "/tmp/worktree" },
+    store,
+  };
+
+  const outcome = await new TaskController(value).run(input);
+
+  assert.match(outcome.reason ?? "", /budget exceeded before next stage/);
+  assert.equal(calls.implement, 0);
+  assert.equal(
+    calls.comments.filter((comment) => comment.includes("Budget exceeded"))
+      .length,
+    1,
+  );
+  assert.equal(
+    (
+      await store.readJson<{ budgetStatus: string }>("metrics.json")
+    ).budgetStatus,
+    "exceeded",
+  );
+  assert.equal((await new TaskController(value).run(input)).status, "blocked");
+  assert.equal(
+    calls.comments.filter((comment) => comment.includes("Budget exceeded"))
+      .length,
+    1,
   );
 });
 

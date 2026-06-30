@@ -156,3 +156,16 @@ export function codexPlanJsonSchema(): Record<string, unknown> {
 export function digestCodexPlan(plan: CodexPlanV2): string {
   return createHash("sha256").update(JSON.stringify(plan)).digest("hex");
 }
+
+export function digestPlanAnswers(
+  answers: Record<string, string>,
+): string {
+  const canonical = Object.fromEntries(
+    Object.entries(answers).sort(([left], [right]) =>
+      left.localeCompare(right),
+    ),
+  );
+  return createHash("sha256")
+    .update(JSON.stringify(canonical))
+    .digest("hex");
+}

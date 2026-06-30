@@ -109,6 +109,9 @@ function help(): void {
       "  cleanup-request --task TASK --target-type file|worktree --target-path ABSOLUTE --reason TEXT",
       "  cleanup-approve --request ID",
       "  cleanup-execute --request ID",
+      "  lease-reclaim --project ID --owner-task TASK --by NAME",
+      "  retention-status --project ID",
+      "  audit --project ID --task TASK",
       "  doctor",
       "  service-install --plist-path ABSOLUTE --node-path ABSOLUTE --cli-path ABSOLUTE --log-dir ABSOLUTE",
       "",
@@ -231,6 +234,28 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         ).execute(stringOption(options, "request")),
       );
       return 0;
+    case "lease-reclaim":
+      output(
+        await service.reclaimLease(
+          stringOption(options, "project"),
+          stringOption(options, "owner-task"),
+          stringOption(options, "by"),
+        ),
+      );
+      return 0;
+    case "retention-status":
+      output(
+        await service.retention(stringOption(options, "project")),
+      );
+      return 0;
+    case "audit": {
+      const report = await service.audit(
+        stringOption(options, "project"),
+        stringOption(options, "task"),
+      );
+      output(report);
+      return report.ok ? 0 : 1;
+    }
     case "doctor": {
       const report = await runDoctor({ configDirectory, runtimeRoot });
       output(report);

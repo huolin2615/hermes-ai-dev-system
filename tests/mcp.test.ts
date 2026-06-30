@@ -32,6 +32,10 @@ test("exposes only the intended non-destructive Hermes MCP tools", async () => {
         codexThreadId: null,
         codexDesktopUrl: null,
         artifactPath: "/tmp/artifacts",
+        activeErrors: [],
+        budgetStatus: "ok" as const,
+        activeDurationMs: 0,
+        operatorWaitDurationMs: 0,
       };
     },
     async approve(

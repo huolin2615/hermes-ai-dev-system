@@ -48,13 +48,88 @@ const validConfig = {
   },
 } as const;
 
+const validV2Config = {
+  ...validConfig,
+  schema_version: 2,
+  budgets: {
+    max_active_minutes: 90,
+    max_codex_input_tokens: 6_000_000,
+    max_codex_output_tokens: 60_000,
+    warning_ratio: 0.75,
+  },
+  retention: {
+    task_artifacts_days: 45,
+    warn_before_days: 10,
+  },
+} as const;
+
 test("parses a strict v1 project configuration", () => {
   const config = parseProjectConfig(validConfig);
 
+  assert.equal(config.schemaVersion, 2);
   assert.equal(config.id, "crm-frontend");
   assert.equal(config.review.maxFixCycles, 2);
   assert.equal(config.codex.turnTimeoutSeconds, 1800);
   assert.deepEqual(config.verification.commands[0]?.argv, ["pnpm", "test"]);
+});
+
+test("normalizes v1 config with hardening defaults", () => {
+  const config = parseProjectConfig(validConfig);
+
+  assert.equal(config.schemaVersion, 2);
+  assert.deepEqual(config.budgets, {
+    maxActiveMinutes: 60,
+    maxCodexInputTokens: 5_000_000,
+    maxCodexOutputTokens: 50_000,
+    warningRatio: 0.8,
+  });
+  assert.deepEqual(config.retention, {
+    taskArtifactsDays: 30,
+    warnBeforeDays: 7,
+  });
+});
+
+test("normalizes explicit v2 budgets and retention", () => {
+  const config = parseProjectConfig(validV2Config);
+
+  assert.deepEqual(config.budgets, {
+    maxActiveMinutes: 90,
+    maxCodexInputTokens: 6_000_000,
+    maxCodexOutputTokens: 60_000,
+    warningRatio: 0.75,
+  });
+  assert.deepEqual(config.retention, {
+    taskArtifactsDays: 45,
+    warnBeforeDays: 10,
+  });
+});
+
+test("rejects a warning ratio outside zero and one", () => {
+  assert.throws(
+    () =>
+      parseProjectConfig({
+        ...validV2Config,
+        budgets: {
+          ...validV2Config.budgets,
+          warning_ratio: 1.2,
+        },
+      }),
+    /budgets\.warning_ratio/,
+  );
+});
+
+test("requires retention warning to precede artifact expiry", () => {
+  assert.throws(
+    () =>
+      parseProjectConfig({
+        ...validV2Config,
+        retention: {
+          task_artifacts_days: 30,
+          warn_before_days: 30,
+        },
+      }),
+    /retention\.warn_before_days/,
+  );
 });
 
 test("rejects shell-string verification commands", () => {

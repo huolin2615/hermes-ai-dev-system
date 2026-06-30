@@ -13,8 +13,7 @@ const verificationCommandSchema = z.strictObject({
   timeout_seconds: z.number().int().positive().default(600),
 });
 
-const projectConfigFileSchema = z.strictObject({
-  schema_version: z.literal(1),
+const commonProjectConfigShape = {
   id: z.string().regex(/^[a-z0-9][a-z0-9_-]*$/),
   repo: z.strictObject({
     path: absolutePath,
@@ -47,7 +46,54 @@ const projectConfigFileSchema = z.strictObject({
   ci: z.strictObject({
     mode: z.enum(["none", "local"]).default("local"),
   }),
+};
+
+const budgetFileSchema = z.strictObject({
+  max_active_minutes: z.number().int().positive(),
+  max_codex_input_tokens: z.number().int().positive(),
+  max_codex_output_tokens: z.number().int().positive(),
+  warning_ratio: z.number().gt(0).lte(1),
 });
+
+const retentionFileSchema = z
+  .strictObject({
+    task_artifacts_days: z.number().int().positive(),
+    warn_before_days: z.number().int().nonnegative(),
+  })
+  .superRefine((retention, context) => {
+    if (retention.warn_before_days >= retention.task_artifacts_days) {
+      context.addIssue({
+        code: "custom",
+        path: ["warn_before_days"],
+        message: "must be less than task_artifacts_days",
+      });
+    }
+  });
+
+const projectConfigFileSchema = z.discriminatedUnion("schema_version", [
+  z.strictObject({
+    schema_version: z.literal(1),
+    ...commonProjectConfigShape,
+  }),
+  z.strictObject({
+    schema_version: z.literal(2),
+    ...commonProjectConfigShape,
+    budgets: budgetFileSchema,
+    retention: retentionFileSchema,
+  }),
+]);
+
+const defaultBudgets = {
+  max_active_minutes: 60,
+  max_codex_input_tokens: 5_000_000,
+  max_codex_output_tokens: 50_000,
+  warning_ratio: 0.8,
+} as const;
+
+const defaultRetention = {
+  task_artifacts_days: 30,
+  warn_before_days: 7,
+} as const;
 
 export interface VerificationCommand {
   id: string;
@@ -57,7 +103,7 @@ export interface VerificationCommand {
 }
 
 export interface ProjectConfig {
-  schemaVersion: 1;
+  schemaVersion: 2;
   id: string;
   repo: {
     path: string;
@@ -90,6 +136,16 @@ export interface ProjectConfig {
   ci: {
     mode: "none" | "local";
   };
+  budgets: {
+    maxActiveMinutes: number;
+    maxCodexInputTokens: number;
+    maxCodexOutputTokens: number;
+    warningRatio: number;
+  };
+  retention: {
+    taskArtifactsDays: number;
+    warnBeforeDays: number;
+  };
 }
 
 function issuePath(issue: z.core.$ZodIssue): string {
@@ -106,8 +162,12 @@ export function parseProjectConfig(input: unknown): ProjectConfig {
   }
 
   const config = result.data;
+  const budgets =
+    config.schema_version === 2 ? config.budgets : defaultBudgets;
+  const retention =
+    config.schema_version === 2 ? config.retention : defaultRetention;
   return {
-    schemaVersion: config.schema_version,
+    schemaVersion: 2,
     id: config.id,
     repo: {
       path: config.repo.path,
@@ -140,6 +200,16 @@ export function parseProjectConfig(input: unknown): ProjectConfig {
       reusableKnowledge: config.knowledge.reusable_knowledge,
     },
     ci: config.ci,
+    budgets: {
+      maxActiveMinutes: budgets.max_active_minutes,
+      maxCodexInputTokens: budgets.max_codex_input_tokens,
+      maxCodexOutputTokens: budgets.max_codex_output_tokens,
+      warningRatio: budgets.warning_ratio,
+    },
+    retention: {
+      taskArtifactsDays: retention.task_artifacts_days,
+      warnBeforeDays: retention.warn_before_days,
+    },
   };
 }
 

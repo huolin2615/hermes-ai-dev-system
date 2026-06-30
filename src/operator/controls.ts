@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import type { ArtifactStore } from "../artifacts/store.js";
 import {
   digestCodexPlan,
+  digestPlanAnswers,
   parseCodexPlan,
   type CodexPlanV2,
 } from "../workflow/plan-contract.js";
@@ -16,6 +17,7 @@ export type ApprovalGate = "plan" | "knowledge";
 
 export interface PlanApprovalPayload {
   planDigest: string;
+  answersDigest: string;
   approvedBy: string;
   approvedAt: string;
   answers: Record<string, string>;
@@ -86,6 +88,9 @@ export class OperatorControls {
         note,
         ...(planDigest ? { planDigest } : {}),
         ...(approvedAnswers ? { answers: approvedAnswers } : {}),
+        ...(approvedAnswers
+          ? { answersDigest: digestPlanAnswers(approvedAnswers) }
+          : {}),
         ...(proposalDigest ? { proposalDigest } : {}),
         ...(proposal ? { proposalPath: proposal.path } : {}),
       },

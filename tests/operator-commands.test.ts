@@ -10,6 +10,10 @@ import {
   OperatorCommandQueue,
   type OperatorCommand,
 } from "../src/operator/commands.js";
+import {
+  digestCodexPlan,
+  type CodexPlanV2,
+} from "../src/workflow/plan-contract.js";
 import { createWorkflowState } from "../src/workflow/state.js";
 
 test("returns only commands without a result in stable order", async () => {
@@ -123,4 +127,53 @@ test("applies pause then resume with one revision per command", () => {
   assert.equal(resumed.status, "applied");
   assert.equal(resumed.state.stage, "context_preparing");
   assert.equal(resumed.state.revision, initial.revision + 2);
+});
+
+test("rejects plan approval when the answer map digest does not match", () => {
+  const approvalPlan: CodexPlanV2 = {
+    version: 2,
+    summary: "Choose a runtime",
+    assumptions: [],
+    files: ["src/app.ts"],
+    tests: [],
+    capabilities: {
+      network: false,
+      dependencyInstall: false,
+      externalWrite: false,
+    },
+    fileDeletions: [],
+    questions: [
+      {
+        id: "runtime",
+        prompt: "Which runtime?",
+        required: true,
+      },
+    ],
+    knowledgeNeeds: [],
+  };
+  const state = {
+    ...createWorkflowState("t_1", "crm", 2),
+    stage: "awaiting_plan_approval" as const,
+  };
+  const command: OperatorCommand = {
+    commandId: "33333333-3333-4333-8333-333333333333",
+    type: "approve_plan",
+    requestedBy: "huolin",
+    requestedAt: "2026-06-30T00:00:00.000Z",
+    payload: {
+      planDigest: digestCodexPlan(approvalPlan),
+      answers: { runtime: "Node.js 22" },
+      answersDigest: "0".repeat(64),
+    },
+  };
+
+  const result = applyOperatorCommand(
+    state,
+    command,
+    approvalPlan,
+    undefined,
+  );
+
+  assert.equal(result.status, "rejected");
+  assert.match(String(result.detail.reason), /answers changed/);
 });

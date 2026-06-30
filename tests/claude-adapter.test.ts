@@ -180,6 +180,14 @@ test("normalizes a prose review once before strict validation", async () => {
 
   assert.equal(review.verdict, "PASS");
   assert.equal(callCount, 2);
+  assert.deepEqual(
+    (
+      review as unknown as {
+        execution: { calls: number; normalizations: number };
+      }
+    ).execution,
+    { calls: 2, normalizations: 1 },
+  );
 });
 
 test("rejects non-zero Claude exits and malformed review output", async () => {

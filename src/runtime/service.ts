@@ -1,10 +1,27 @@
 import { readFile } from "node:fs/promises";
 
 import { ArtifactStore } from "../artifacts/store.js";
+import {
+  TaskErrorStore,
+  type TaskErrorRecord,
+} from "../artifacts/errors.js";
+import {
+  TaskMetrics,
+  type BudgetStatus,
+} from "../artifacts/metrics.js";
 import { findProjectConfig } from "../config/registry.js";
+import {
+  scanRetention,
+  type RetentionStatus,
+} from "../cleanup/retention.js";
 import { GitAdapter } from "../git/adapter.js";
 import { HermesKanbanClient } from "../hermes/client.js";
 import { OperatorControls, type ApprovalGate } from "../operator/controls.js";
+import {
+  RepoWriteLease,
+  type RepoLeaseOwner,
+} from "./repo-lease.js";
+import { auditTask, type TaskAuditReport } from "./audit.js";
 
 export interface TaskStatus {
   projectId: string;
@@ -16,11 +33,22 @@ export interface TaskStatus {
   codexThreadId: string | null;
   codexDesktopUrl: string | null;
   artifactPath: string;
+  activeErrors: TaskErrorRecord[];
+  budgetStatus: BudgetStatus;
+  activeDurationMs: number;
+  operatorWaitDurationMs: number;
 }
 
 export interface QueuedOperatorAction {
   commandId: string;
   status: "queued";
+}
+
+export interface ReclaimedLease {
+  projectId: string;
+  taskId: string;
+  pid: number;
+  status: "reclaimed";
 }
 
 async function optionalJson<T>(target: string): Promise<T | null> {
@@ -81,7 +109,7 @@ export class AiDevService {
   }
 
   async status(projectId: string, taskId: string): Promise<TaskStatus> {
-    const { hermes, store } = await this.resources(projectId, taskId);
+    const { config, hermes, store } = await this.resources(projectId, taskId);
     if (!store) throw new Error("artifact store unavailable");
     const details = await hermes.show(taskId);
     const state = await optionalJson<{
@@ -89,6 +117,11 @@ export class AiDevService {
       codexThreadId?: string;
     }>(store.resolve("state.json"));
     const threadId = state?.codexThreadId ?? null;
+    const activeErrors = await new TaskErrorStore(store).active();
+    const metrics = await new TaskMetrics(
+      store,
+      config.budgets,
+    ).summary();
     return {
       projectId,
       taskId,
@@ -101,6 +134,10 @@ export class AiDevService {
         ? `codex://threads/${encodeURIComponent(threadId)}`
         : null,
       artifactPath: store.taskRoot,
+      activeErrors,
+      budgetStatus: metrics.budgetStatus,
+      activeDurationMs: metrics.activeDurationMs,
+      operatorWaitDurationMs: metrics.operatorWaitDurationMs,
     };
   }
 
@@ -155,5 +192,76 @@ export class AiDevService {
     }
     await hermes.unblock(taskId);
     return { commandId: command.commandId, status: "queued" };
+  }
+
+  async reclaimLease(
+    projectId: string,
+    ownerTaskId: string,
+    approvedBy: string,
+  ): Promise<ReclaimedLease> {
+    const { config, hermes } = await this.resources(projectId);
+    const lease = new RepoWriteLease(this.runtimeRoot, config.id);
+    const initialDiagnosis = await lease.diagnose();
+    if (
+      initialDiagnosis.available ||
+      initialDiagnosis.ownerTaskId !== ownerTaskId ||
+      initialDiagnosis.pid === null ||
+      initialDiagnosis.acquiredAt === null ||
+      initialDiagnosis.ownerPath === null
+    ) {
+      throw new Error(
+        `lease owner does not match requested task: ${ownerTaskId}`,
+      );
+    }
+    const details = await hermes.show(ownerTaskId);
+    const taskRunActive = details.runs.some(
+      (run) => run.status === "running" && run.ended_at == null,
+    );
+    const diagnosis = await lease.diagnose(taskRunActive);
+    if (!diagnosis.stale) {
+      throw new Error(
+        taskRunActive
+          ? `Hermes task run is still active: ${ownerTaskId}`
+          : `lease owner process is still alive: ${ownerTaskId}`,
+      );
+    }
+    const owner: RepoLeaseOwner = {
+      projectId: config.id,
+      taskId: ownerTaskId,
+      pid: initialDiagnosis.pid,
+      acquiredAt: initialDiagnosis.acquiredAt,
+      ownerPath: initialDiagnosis.ownerPath,
+    };
+    await lease.reclaimStale(owner, approvedBy, taskRunActive);
+    return {
+      projectId: config.id,
+      taskId: ownerTaskId,
+      pid: owner.pid,
+      status: "reclaimed",
+    };
+  }
+
+  async retention(projectId: string): Promise<RetentionStatus[]> {
+    const { config } = await this.resources(projectId);
+    return scanRetention(this.runtimeRoot, [config]);
+  }
+
+  async audit(
+    projectId: string,
+    taskId: string,
+  ): Promise<TaskAuditReport> {
+    const { config, hermes, store } = await this.resources(
+      projectId,
+      taskId,
+    );
+    if (!store) throw new Error("artifact store unavailable");
+    const details = await hermes.show(taskId);
+    if (!details.task.workspace_path) {
+      throw new Error(`task ${taskId} has no worktree path`);
+    }
+    return auditTask(store, {
+      worktreePath: details.task.workspace_path,
+      baseBranch: config.repo.baseBranch,
+    });
   }
 }

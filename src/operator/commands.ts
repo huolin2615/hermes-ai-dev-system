@@ -4,6 +4,7 @@ import { readdir } from "node:fs/promises";
 import type { ArtifactStore } from "../artifacts/store.js";
 import {
   digestCodexPlan,
+  digestPlanAnswers,
   type CodexPlanV2,
 } from "../workflow/plan-contract.js";
 import {
@@ -160,6 +161,12 @@ export function applyOperatorCommand(
         return rejected(state, "plan changed after approval was requested");
       }
       const answers = answerPayload(command);
+      if (
+        stringPayload(command, "answersDigest") !==
+        digestPlanAnswers(answers)
+      ) {
+        return rejected(state, "plan approval answers changed after approval");
+      }
       for (const question of plan.questions) {
         if (!answers[question.id]?.trim()) {
           return rejected(
@@ -177,6 +184,7 @@ export function applyOperatorCommand(
         approval: {
           commandId: command.commandId,
           planDigest: expectedDigest,
+          answersDigest: digestPlanAnswers(answers),
           approvedBy: command.requestedBy,
           approvedAt: command.requestedAt,
           note: stringPayload(command, "note") ?? "",

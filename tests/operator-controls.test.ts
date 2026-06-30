@@ -44,6 +44,7 @@ test("queues an auditable plan approval without writing approval state", async (
   assert.equal(command.type, "approve_plan");
   assert.equal(command.requestedBy, "huolin");
   assert.match(String(command.payload.planDigest), /^[a-f0-9]{64}$/);
+  assert.match(String(command.payload.answersDigest), /^[a-f0-9]{64}$/);
   assert.equal(await store.exists("approvals/plan.json"), false);
 });
 
@@ -72,6 +73,7 @@ test("requires and persists answers for every plan question", async () => {
     command.payload.answers,
     { target_runtime: "Node.js 22" },
   );
+  assert.match(String(command.payload.answersDigest), /^[a-f0-9]{64}$/);
 });
 
 test("pause and resume enqueue without directly mutating workflow state", async () => {
